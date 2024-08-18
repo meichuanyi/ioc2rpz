@@ -158,11 +158,14 @@ clean_feed(IOC,none, "mixed") ->
 clean_feed(IOC,none,IoCType) ->
   [ {X,0,IoCType} || X <- IOC, X /= <<>>];
 
-%Default REFEX
+%Default REGEX
 %Extract IOCs,remove unsupported chars using standard REGEX. Expiration date is not supported;
 clean_feed(IOC,[],IoCType) ->
   %TODO update regex
   {ok,MP} = re:compile("^([A-Za-z0-9][A-Za-z0-9\-\._]+)[^A-Za-z0-9\-\._]*.*$",[{newline, any}]),
+  %do not allow "." and better hostname handeling
+  % to validate regex below 2024-08-18
+%  {ok,MP} = re:compile("^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$",[{newline, any}]),
   {ok,IPREX} = re:compile("^([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(\\/[0-9]{1,3})?)$|(:)"), %regex to check ip/fqdn
   [ X || X <- clean_feed(IOC,[],MP, IoCType, IPREX), X /= <<>>];
 

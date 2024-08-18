@@ -2,7 +2,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)  
 
 ## Short summary
-ioc2rpz™: The DNS Security Solution - ioc2rpz™ is a powerful DNS server that transforms threat indicators into actionable Response Policy Zone (RPZ) feeds. It automates the update process, ensuring your network is protected against the latest threats, including malicious domains and IP addresses. By converting IOC feeds into RPZs, ioc2rpz™ acts as a crucial link between threat intelligence and DNS security, compatible with RPZ-supporting DNS servers like ISC Bind or PowerDNS. Learn more about how ioc2rpz™ can secure your network at ioc2rpz™ official website.
+ioc2rpz™: The DNS Security Solution - ioc2rpz™ is a powerful DNS server that transforms threat indicators into actionable Response Policy Zone (RPZ) feeds. It automates the update process, ensuring your network is protected against the latest threats, including malicious domains and IP addresses. By converting IOC feeds into RPZs, ioc2rpz™ acts as a crucial link between threat intelligence and DNS security, compatible with RPZ-supporting DNS servers like ISC Bind or PowerDNS.
 
 ## Overview
 

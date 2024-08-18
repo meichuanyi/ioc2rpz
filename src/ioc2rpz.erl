@@ -1,4 +1,4 @@
-%Copyright 2017-2021 Vadim Pavlov ioc2rpz[at]gmail[.]com
+%Copyright 2017-2024 Vadim Pavlov ioc2rpz[at]gmail[.]com
 %
 %Licensed under the Apache License, Version 2.0 (the "License");
 %you may not use this file except in compliance with the License.
@@ -76,7 +76,7 @@ handle_info({tcp, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socke
   parse_dns_request(Socket, Pkt1, #proto{proto=tcp, tls=no, rip=R_ip, rport=R_port}),
   ok = gen_tcp:close(Socket),
 %  fprof:trace(stop),
-  {noreply, State};
+  {stop, normal , State}; 
 
 handle_info({ssl, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socket=_ListenSocket, params=_Params}) ->
 %  fprof:trace(start),
@@ -84,7 +84,7 @@ handle_info({ssl, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socke
   parse_dns_request(Socket, Pkt1, #proto{proto=tcp, tls=yes, rip=R_ip, rport=R_port}),
   ok = ssl:close(Socket),
 %  fprof:trace(stop),
-  {noreply, State};
+  {stop, normal , State};
 
 
 handle_info({tcp_closed, _Socket}, State) ->

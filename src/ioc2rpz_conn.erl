@@ -21,11 +21,13 @@
 get_ioc(URL,REGEX,Source) ->
   case get_ioc(URL,?Src_Retry) of
     {ok, Bin} ->
+      ioc2rpz_fun:logMessage("Source: ~p, REX ~p, max IoCs ~p, type ~p ~n",[Source#source.name, REGEX,Source#source.max_ioc,Source#source.ioc_type]),
       ioc2rpz_fun:logMessage("Source: ~p, size: ~s (~p), MD5: ~p ~n",[Source#source.name, ioc2rpz_fun:conv_to_Mb(byte_size(Bin)),byte_size(Bin), ioc2rpz_fun:bin_to_hexstr(crypto:hash(md5,Bin))]), %TODO debug
 
       %TODO spawn cleanup
       CTime=ioc2rpz_fun:curr_serial_60(),
       %L=[ {ioc2rpz_fun:bin_to_lowcase(X),Y} || {X,Y} <- clean_feed(ioc2rpz_fun:split_tail(Bin,<<"\n">>),REGEX) ],
+
       L=p_clean_feed(ioc2rpz_fun:split_tail(Bin,[<<"\r\n">>,<<"\n">>,<<"\r">>]),REGEX,Source#source.max_ioc,Source#source.ioc_type),
 
       ioc2rpz_fun:logMessage("Source: ~p, got ~p indicators, clean time ~p ~n",[Source#source.name, length(L), (ioc2rpz_fun:curr_serial_60()-CTime)]), %TODO debug
@@ -180,7 +182,7 @@ clean_feed([Head|Tail],CleanIOC,REX,IoCType, IPREX) ->
   IOC2 = case re:run(Head,REX,[global,notempty,{capture,[1,2],binary}]) of
     {match,[[IOC,<<>>]]} -> {IOC,0, check_if_ip(IOC, IoCType, IPREX)};
     {match,[[IOC,EXP]]} -> {IOC, conv_t2i(EXP), check_if_ip(IOC, IoCType, IPREX)};
-    _Else -> <<>>
+    _Else -> ioc2rpz_fun:logMessage("Bad IOC: ~p, Type ~p ~n",[Head,IoCType]), <<>>
   end,
   clean_feed(Tail, [IOC2 | CleanIOC], REX, IoCType, IPREX);
 

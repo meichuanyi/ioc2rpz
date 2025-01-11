@@ -19,7 +19,7 @@
 -include_lib("ioc2rpz.hrl").
 -export([logMessage/2,logMessageCEF/2,strs_to_binary/1,curr_serial/0,curr_serial_60/0,constr_ixfr_url/3,ip_to_bin/1,read_local_actions/1,split_bin_bytes/2,split_tail/2,rsplit_tail/2,
          bin_to_lowcase/1,ip_in_list/2,intersection/2,bin_to_hexstr/1,conv_to_Mb/1,q_class/1,q_type/1,split/2,msg_CEF/1,base64url_decode/1,get_cipher_suites/1,
-         str_to_ip/1,requests_rate_limit/1]).
+         str_to_ip/1,check_rate_limit/1]).
 
 logMessage(Message, Vars) ->
   logMessage(group_leader(), Message, Vars).
@@ -73,7 +73,9 @@ msg_CEF(222)    -> "|000222|DNS Notify error|5|dst=~s dpt=~s proto=~s zone=~p ms
 
 msg_CEF(301)    -> "|000301|MGMT request denied|7|src=~s spt=~p proto=~p qname=~p qtype=~p qclass=~p tsigkey=~p msg=~p~n";
 
-msg_CEF(501)    -> "|000501|Possible DDoS CVE-2004-0789|3|src=~s spt=~p proto=~p~n";
+msg_CEF(429)    -> "|000429|Too many requests|7|src=~s spt=~p proto=~p qname=~p qtype=~p qclass=~p~n";
+
+msg_CEF(501)    -> "|000501|Possible DDoS CVE-2004-0789|37|src=~s spt=~p proto=~p~n";
 
 msg_CEF(_)    -> "Not defined~n".
 
@@ -189,14 +191,15 @@ rsplit_tail(String, Pattern) ->
 %		[] -> []
 %	end.
 
+%%% bin_to_lowcase
+%%% 2025-01-10 Remove blow after validation of the optimization
 bin_to_lowcase(A) ->
  << << (b_to_lowcase(C)) >> || << C >> <= A >>.
-% << << C >> || << C >> <= A >>.
-
 b_to_lowcase(A) when A>=65,A=<90 ->
  A+32;
 b_to_lowcase(A) ->
  A.
+%%% End bin_to_lowcase
 
 ip_in_list(IP,LST) -> %TODO check CIDR as well
  lists:member(IP,LST).
@@ -292,21 +295,27 @@ get_cipher_suites(TLSVersion) when TLSVersion=="tlsv1.2";TLSVersion=="tlsv1.3";T
   logMessage("unsuported TLS version ~s ~n", [TLSVersion]),
   ssl:cipher_suites(default, 'tlsv1.2').
 
-%%%
-%%%rate limit requests
-%%%
-requests_rate_limit({Tsig,Zone,axfr,_Proto}=Request) ->
-  %pull atomic ref by id (tsig+zone+axfr)  from a table ets.new(@ets_table, [:named_table, :ordered_set, :public]) atomics monotonic_time(:millisecond)
-  %update and calculate atomic 1m, 5m, 1h, 1d
-  %ets:insert_new(cfg_table, {cfg_file,Filename}),
-  %TODO 1. save atomic in state variables, if not found - check ets cfg_table
-  %response if there are violations with the violation type
-  ok;
-requests_rate_limit({Tsig,Zone,_Type,_Proto}=Request) ->
-  ok.
-%%%
-%%%END rate limit requests
-%%%
+%%%Rate limiting function
+check_rate_limit(Id) ->
+  CurrentTime = erlang:system_time(millisecond),
+  case ets:lookup(?RATE_LIMIT_TABLE, Id) of
+      [{Id, {LastRequestTime, RequestCount}}] ->
+          if CurrentTime - LastRequestTime < ?RATE_LIMIT_WINDOW ->
+              if RequestCount >= ?MAX_REQUESTS_PER_WINDOW ->
+                  true; % Rate limit exceeded
+              true ->
+                  ets:insert(?RATE_LIMIT_TABLE, {Id, {CurrentTime, RequestCount + 1}}),
+                  false % Rate limit not exceeded
+              end;
+          true ->
+              ets:insert(?RATE_LIMIT_TABLE, {Id, {CurrentTime, 1}}), % Reset count if outside the window
+              false
+          end;
+      [] ->
+          ets:insert(?RATE_LIMIT_TABLE, {Id, {CurrentTime, 1}}), % First request from this IP
+          false
+  end.
+%%%End rate limit function
 
 %%%%
 %%%% EUnit tests
@@ -352,3 +361,4 @@ bin_to_lowcase_test() ->[
 	?assert(bin_to_lowcase(<<"f">>) =:= <<"f">>),
 	?assert(bin_to_lowcase(<<"eeeeeeeeeeeeeeeeeeeeeee">>) =:= <<"eeeeeeeeeeeeeeeeeeeeeee">>)
 ].
+

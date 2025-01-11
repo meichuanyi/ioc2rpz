@@ -1,13 +1,14 @@
 ## Bugs
+- [ ] Zone update can be triggered twice (Serial is the same) which leads to duplicate packets in the rpz_axfr_table. A workaround was implemented in read_db_pkt function to ensure that only one set of packets is passed but it impacts performance. 
 - [ ] Check zone refresh time when the SOA record is requested (different vs axfr)
 - [ ] Take a look on the bugs mentioned in REST section
-- [x] Validate an empty zone response - wrong RR count 6 vs 3
 - [ ] If a TSIG is not auth. different responses on SOA and AXFR
 - [ ] If a source was removed, RPZ will fail - add validation/clean up
 
 ## Core / DNS
 - [ ] If connection was closed by remote server - log that instead of "success"
-- [ ] DNS requests rate limiting
+- [x] DNS requests rate limiting
+- [ ] Ratelimit params to config
 - [ ] Sample zone is broken
 - [ ] If IXFR source not set or equal AXFR - get removed records for IXFR
 - [ ] Force RPZ, Source refresh
@@ -94,3 +95,6 @@ https://github.com/ChicagoBoss/ChicagoBoss/wiki/Automatic-schema-initialization-
 ## Other/optimization TODO
 - [ ] (1) Do not cache expired IOCs if ExpDateTime<Serial_IXFR / update ExpDateTime if exists
 - [ ] (1) Check zones IXFR update from multiple sources
+
+
+

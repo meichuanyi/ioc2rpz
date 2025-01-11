@@ -1,5 +1,8 @@
 # ioc2rpz change log
 [CB] - Changed Behaviour
+## 2025-01-10 v1.3.0.0
+- Query rate limiting
+
 ## 2021-07-31 v1.1.3.0
 - new REST API calls
 - source types

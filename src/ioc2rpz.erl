@@ -1,4 +1,4 @@
-%Copyright 2017-2024 Vadim Pavlov ioc2rpz[at]gmail[.]com
+%Copyright 2017-2025 Vadim Pavlov ioc2rpz[at]gmail[.]com
 %
 %Licensed under the Apache License, Version 2.0 (the "License");
 %you may not use this file except in compliance with the License.
@@ -35,27 +35,59 @@ init([Socket,[Pid,Proc,TLS]]) ->
   {ok, #state{socket=Socket, tls=TLS, params=[Pid,Proc]}}.
 
 %%%TCP accept
+%handle_cast(accept, State = #state{socket=ListenSocket, tls=no, params=[Pid,Proc]}) ->
+%  {Respond, AcceptSocket} = case gen_tcp:accept(ListenSocket) of
+%    {ok, ASocket} -> {noreply, ASocket};
+%    {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TCP accept error: ~p ~n",[?MODULE, ?FUNCTION_NAME, ?LINE, Reason]), {stop, ListenSocket}
+%  end,
+%  ioc2rpz_proc_sup:start_socket(Proc),
+%  {Respond, State#state{socket=AcceptSocket, tls=no, params=[Pid,Proc]}};
+%%%TLS accept
+%handle_cast(accept, State = #state{socket=ListenSocket, tls=yes, params=[Pid,Proc]}) ->
+%  case ssl:transport_accept(ListenSocket) of
+%    {ok, TLSTransportSocket} ->
+%        {Respond, AcceptSocket} = case ssl:handshake(TLSTransportSocket) of
+%          {ok, ASocket} -> {noreply, ASocket};
+%          {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TLS accept error: ~p ~n",[?MODULE, ?FUNCTION_NAME, ?LINE, Reason]), {stop, ListenSocket}
+%        end;
+%    {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TLS accept error: ~p ~n",[?MODULE, ?FUNCTION_NAME, ?LINE, Reason]), {Respond, AcceptSocket} = {stop, ListenSocket}
+%  end,
+%  %% Boot a new listener to replace this one.
+%  ioc2rpz_proc_sup:start_socket(Proc),
+%  {Respond, State#state{socket=AcceptSocket, tls=yes, params=[Pid,Proc]}};
+
+%%% Improved accept handling 2025-01-07. In case of a error, why we don't start a new socket?
+%%%TCP accept
 handle_cast(accept, State = #state{socket=ListenSocket, tls=no, params=[Pid,Proc]}) ->
-  {Respond, AcceptSocket} = case gen_tcp:accept(ListenSocket) of
-    {ok, ASocket} -> {noreply, ASocket};
-    {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TCP accept error: ~p ~n",[?MODULE, ?FUNCTION_NAME, ?LINE, Reason]), {stop, ListenSocket}
-  end,
-  ioc2rpz_proc_sup:start_socket(Proc),
-  {Respond, State#state{socket=AcceptSocket, tls=no, params=[Pid,Proc]}};
+  case gen_tcp:accept(ListenSocket) of
+      {ok, AcceptSocket} ->
+          ioc2rpz_proc_sup:start_socket(Proc), % Start a new listener immediately
+          {noreply, State#state{socket=AcceptSocket, tls=no, params=[Pid,Proc]}};
+      {error, Reason} ->
+          ioc2rpz_fun:logMessage("~p:~p:~p. TCP accept error: ~p ~n",
+                               [?MODULE, ?FUNCTION_NAME, ?LINE, Reason]),
+          {stop, Reason, State} % Stop the worker process
+  end;
 
 %%%TLS accept
 handle_cast(accept, State = #state{socket=ListenSocket, tls=yes, params=[Pid,Proc]}) ->
   case ssl:transport_accept(ListenSocket) of
-    {ok, TLSTransportSocket} ->
-        {Respond, AcceptSocket} = case ssl:handshake(TLSTransportSocket) of
-          {ok, ASocket} -> {noreply, ASocket};
-          {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TLS accept error: ~p ~n",[?MODULE, ?FUNCTION_NAME, ?LINE, Reason]), {stop, ListenSocket}
-        end;
-    {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TLS accept error: ~p ~n",[?MODULE, ?FUNCTION_NAME, ?LINE, Reason]), {Respond, AcceptSocket} = {stop, ListenSocket}
-  end,
-  %% Boot a new listener to replace this one.
-  ioc2rpz_proc_sup:start_socket(Proc),
-  {Respond, State#state{socket=AcceptSocket, tls=yes, params=[Pid,Proc]}};
+      {ok, TLSTransportSocket} ->
+          case ssl:handshake(TLSTransportSocket) of
+              {ok, AcceptSocket} ->
+                  ioc2rpz_proc_sup:start_socket(Proc),
+                  {noreply, State#state{socket=AcceptSocket, tls=yes, params=[Pid,Proc]}};
+              {error, HandshakeReason} ->
+                  ioc2rpz_fun:logMessage("~p:~p:~p. TLS handshake error: ~p ~n",
+                                        [?MODULE, ?FUNCTION_NAME, ?LINE, HandshakeReason]),
+                  ssl:close(TLSTransportSocket), % Close the transport socket
+                  {stop, HandshakeReason, State} % Stop the worker
+          end;
+      {error, AcceptReason} ->
+          ioc2rpz_fun:logMessage("~p:~p:~p. TLS accept error: ~p ~n",
+                                [?MODULE, ?FUNCTION_NAME, ?LINE, AcceptReason]),
+          {stop, AcceptReason, State} % Stop the worker
+  end;
 
 handle_cast(_, State) ->
   {noreply, State}.
@@ -74,18 +106,25 @@ handle_info({tcp, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socke
 %  fprof:trace(start),
   {ok,{R_ip,R_port}}=inet:peername(Socket),
   parse_dns_request(Socket, Pkt1, #proto{proto=tcp, tls=no, rip=R_ip, rport=R_port}),
-  ok = gen_tcp:close(Socket),
-%  fprof:trace(stop),
+%  ok = gen_tcp:close(Socket),
+  case gen_tcp:close(Socket) of % Improved closing
+    ok -> ok;
+    {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. TCP close error: ~p ~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Reason])
+  end,
+  %  fprof:trace(stop),
   {stop, normal , State}; 
 
 handle_info({ssl, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socket=_ListenSocket, params=_Params}) ->
 %  fprof:trace(start),
   {ok,{R_ip,R_port}}=ssl:peername(Socket),
   parse_dns_request(Socket, Pkt1, #proto{proto=tcp, tls=yes, rip=R_ip, rport=R_port}),
-  ok = ssl:close(Socket),
+%  ok = ssl:close(Socket),
+  case ssl:close(Socket) of % Improved closing
+    ok -> ok;
+    {error, Reason} -> ioc2rpz_fun:logMessage("~p:~p:~p. SSL close error: ~p ~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Reason])
+  end,
 %  fprof:trace(stop),
   {stop, normal , State};
-
 
 handle_info({tcp_closed, _Socket}, State) ->
   {stop, normal, State};
@@ -97,9 +136,8 @@ handle_info({ssl_closed, _Socket}, State) ->
 handle_info({ssl_error, _Socket, _}, State) ->
   {stop, normal, State};
 
-
-handle_info(E, State) ->
-  ioc2rpz_fun:logMessage("unexpected: ~p ~n", [E]),
+handle_info(Msg, State) ->
+  ioc2rpz_fun:logMessage("Unexpected message: ~p, State: ~p~n", [Msg, State]),
   {noreply, State}.
 
 handle_call(_E, _From, State) ->
@@ -187,13 +225,23 @@ parse_dns_request(Socket, <<DNSId:2/binary, _:1, OptB:7, _:1, OptE:3, _:4, QDCOU
   ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(102),[ip_to_str(Proto#proto.rip),Proto#proto.rport,?iif(Proto#proto.tls == yes,tls,Proto#proto.proto),QStr, ioc2rpz_fun:q_type(QType), ioc2rpz_fun:q_class(QClass)]),
   send_REQST(Socket, DNSId, <<1:1,OptB:7, 0:1, OptE:3,?SERVFAIL:4>>, <<QDCOUNT:2,ANCOUNT:2,NSCOUNT:2,ARCOUNT:2>>, Rest, [], Proto);
 
-parse_dns_request(Socket, <<PH:4/bytes, QDCOUNT:2/big-unsigned-unit:8,ANCOUNT:2/big-unsigned-unit:8,NSCOUNT:2/big-unsigned-unit:8,ARCOUNT:2/big-unsigned-unit:8, Rest/binary>> = _Data, Proto) when QDCOUNT == 1, ANCOUNT == 0 -> %_DataLen:2/big-unsigned-unit:8,
+parse_dns_request(Socket, <<PH:4/bytes, _QDCOUNT:2/big-unsigned-unit:8,_ANCOUNT:2/big-unsigned-unit:8,_NSCOUNT:2/big-unsigned-unit:8,_ARCOUNT:2/big-unsigned-unit:8, Rest/binary>> = Data, Proto = #proto{rip = Rip}) ->
+  <<DNSId:2/binary, _:1, OptB:7, _:1, OptE:3, _:4>> = PH,
+  {<<QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8, _Other_REC/binary>>,QName} = extract_label(Rest,<<>>),
+  Question = <<QName/binary,0:8,QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8>>,
+  QStr=dombin_to_str(QName),
+  case ioc2rpz_fun:check_rate_limit({Rip,QName,QType}) of
+      true -> % Rate limit exceeded - send refused
+        ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(429),[ip_to_str(Proto#proto.rip),Proto#proto.rport,?iif(Proto#proto.tls == yes,tls,Proto#proto.proto),QStr,ioc2rpz_fun:q_type(QType), ioc2rpz_fun:q_class(QClass)]), % Log rate limiting event
+        send_REQST(Socket, DNSId, <<1:1,OptB:7, 0:1, OptE:3,?REFUSED:4>>, <<1:16,0:16,0:16,0:16>>, Question, [], Proto);
+      false -> % Rate limit not exceeded, process the request
+        %2025-01-10 TODO optimize passing processed data
+        process_dns_request(Socket, Data, Proto)
+  end.
+
+process_dns_request(Socket, <<PH:4/bytes, QDCOUNT:2/big-unsigned-unit:8,ANCOUNT:2/big-unsigned-unit:8,NSCOUNT:2/big-unsigned-unit:8,ARCOUNT:2/big-unsigned-unit:8, Rest/binary>> = _Data, Proto) when QDCOUNT == 1, ANCOUNT == 0 -> %_DataLen:2/big-unsigned-unit:8,
   STime=erlang:system_time(millisecond), %nanosecond, microsecond, millisecond, second
   <<DNSId:2/binary, _:1, OptB:7, _:1, OptE:3, _:4>> = PH,
-
-  %%% replace by extract_label(,<<>>)
-  %%% 2020-08-22 to remove after QA
-  %[QName,<<QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8, Other_REC/binary>>] = binary:split(Rest,<<0>>),
   {<<QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8, Other_REC/binary>>,QName} = extract_label(Rest,<<>>),
   Question = <<QName/binary,0:8,QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8>>,
   QStr=dombin_to_str(QName),

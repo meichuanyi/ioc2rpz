@@ -18,6 +18,10 @@
 -include_lib("ioc2rpz.hrl").
 -export([get_ioc/3,clean_feed_bin/2,clean_feed/3]).
 
+-define(IP_REGEX, re:compile("^([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(\\/[0-9]{1,3})?)$|(:)")). %regex to check ip/fqdn
+-define(DEFAULT_REGEX,re:compile("^([A-Za-z0-9][A-Za-z0-9\-\._]+)[^A-Za-z0-9\-\._]*.*$",[{newline, any}])). %default clean up regex
+-define(NELINE_REGEX,re:compile(REX,[{newline, any}])).
+
 get_ioc(URL,REGEX,Source) ->
   case get_ioc(URL,?Src_Retry) of
     {ok, Bin} ->
@@ -154,7 +158,7 @@ get_ioc(<<Proto:5/bytes,_/binary>> = URL, Retry) when Proto == <<"http:">>;Proto
 %No clean REGEX
 %Read IOCs. One IOC per a line. Do not perform any modifications. Expiration date is not supported. During a next full zone update (AXFR update). All IOCs are refreshed;
 clean_feed(IOC,none, "mixed") ->
-  {ok,IPREX} = re:compile("^([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(\\/[0-9]{1,3})?)$|(:)"), %regex to check ip/fqdn
+  {ok,IPREX} = ?IP_REGEX,
   [ {X,0,check_if_ip(X, "mixed", IPREX)} || X <- IOC, X /= <<>>];
 
 clean_feed(IOC,none,IoCType) ->
@@ -164,18 +168,18 @@ clean_feed(IOC,none,IoCType) ->
 %Extract IOCs,remove unsupported chars using standard REGEX. Expiration date is not supported;
 clean_feed(IOC,[],IoCType) ->
   %TODO update regex
-  {ok,MP} = re:compile("^([A-Za-z0-9][A-Za-z0-9\-\._]+)[^A-Za-z0-9\-\._]*.*$",[{newline, any}]),
+  {ok,MP} = ?DEFAULT_REGEX,
   %do not allow "." and better hostname handeling
   % to validate regex below 2024-08-18
 %  {ok,MP} = re:compile("^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$",[{newline, any}]),
-  {ok,IPREX} = re:compile("^([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(\\/[0-9]{1,3})?)$|(:)"), %regex to check ip/fqdn
+  {ok,IPREX} = ?IP_REGEX,
   [ X || X <- clean_feed(IOC,[],MP, IoCType, IPREX), X /= <<>>];
 
 
 %Extract IOCs,remove unsupported chars using user's defined REGEX. Expiration date is supported. First value - IOC, second - Exp. Date;
 clean_feed(IOC,REX,IoCType) -> %REX - user's regular expression
-  {ok,MP} = re:compile(REX,[{newline, any}]),
-  {ok,IPREX} = re:compile("^([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(\\/[0-9]{1,3})?)$|(:)"), %regex to check ip/fqdn
+  {ok,MP} = ?NELINE_REGEX,
+  {ok,IPREX} = ?IP_REGEX,
   [ X || X <- clean_feed(IOC,[],MP,IoCType, IPREX), X /= <<>>].
 
 clean_feed([Head|Tail],CleanIOC,REX,IoCType, IPREX) ->
@@ -207,11 +211,11 @@ clean_feed_bin(IOC,none) ->
   [ {X,0} || X <- IOC, X /= <<>>];
 
 clean_feed_bin(IOC,[]) ->
-  {ok,MP} = re:compile("^([A-Za-z0-9][A-Za-z0-9\-\._]+)[^A-Za-z0-9\-\._]*.*$",[{newline, any}]),
+  {ok,MP} = ?DEFAULT_REGEX,
   [ X || X <- clean_feed_bin(IOC,<<>>,MP), X /= <<>>];
 
 clean_feed_bin(IOC,REX) -> %REX - user's regular expression
-  {ok,MP} = re:compile(REX,[{newline, any}]),
+  {ok,MP} = ?NELINE_REGEX,
   [ X || X <- clean_feed_bin(IOC,<<>>,MP), X /= <<>>].
 
 clean_feed_bin([Head|Tail],CleanIOC,REX) ->

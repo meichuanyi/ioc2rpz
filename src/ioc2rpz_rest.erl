@@ -59,7 +59,7 @@ is_authorized(Req, State) ->
 			end;
 		{{bearer, Token}, true} ->
             ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(131),[ioc2rpz:ip_to_str(IP), Port, cowboy_req:path(Req), ""]),
-			{false, Req, State#state{user=Token}};
+			{{false, <<"Token">>}, Req, State#state{user=Token}};
 
 		{_, false} ->
             ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(135),[ioc2rpz:ip_to_str(IP), Port, cowboy_req:path(Req), ""]),

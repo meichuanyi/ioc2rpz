@@ -41,10 +41,11 @@ init([IPStr,IPStr6, Filename, DBDir]) ->
   {ok, _} = ioc2rpz_db:init_db(?DBStorage,DBDir,PidDB),
 
   ets:insert_new(cfg_table, {cfg_file,Filename}), ets:insert_new(cfg_table, {db_dir,DBDir}),
+  ets:new(?RATE_LIMIT_TABLE, [named_table, public, {read_concurrency, true}, {write_concurrency, true}]), %rate limiting table
   {ok,RPZ,_,_} = read_config3(Filename),
   %os:set_signal(sighup,handle),
   %os:set_signal(sigterm,handle),
-  ioc2rpz_db:clean_DB(RPZ),
+  ioc2rpz_db:clean_DB(RPZ), %looks like it shouldn't be called here 2025-01-11
   inets:start(), ssl:start(),
 %  spawn(ioc2rpz_sup,update_all_zones,[false]), %load zones to cache
 %  spawn_opt(ioc2rpz_sup,update_all_zones,[false],[link,{fullsweep_after,0}]), %load zones to cache
@@ -371,14 +372,14 @@ read_config3([],reload,Srv,Keys,_Key_Groups,WhiteLists,Sources,RPZ)  ->
 
   [ ioc2rpz_fun:logMessage("Zone ~p was updated. Terminating ~p.~n",[X#rpz.zone_str,X#rpz.pid]) || X <- RPZ_UPD, X#rpz.status == updating ],
   [ ioc2rpz_fun:logMessage("Zone ~p was removed. Terminating ~p.~n",[X#rpz.zone_str,X#rpz.pid]) || X <- RPZ_D, X#rpz.status == updating ],
-  [ exit(X#rpz.pid,rpzRemoved) || X <- RPZ_D, X#rpz.status == updating],
+  [ exit(X#rpz.pid,rpzRemoved) || X <- RPZ_D, X#rpz.status == updating], %TODO 2025-01-11 replace by supervisor:terminate_child(SupervisorPid, X#rpz.pid). Where to get supervisor?
   [ exit(X#rpz.pid,rpzUpdated) || X <- RPZ_UPD, X#rpz.status == updating],
 
   [ ets:delete(cfg_table, [rpz,X#rpz.zone]) || X <- RPZ_D ],
   [ ets:insert(cfg_table, {[rpz,X#rpz.zone],X#rpz.zone,X}) || X <- RPZ_V ],
   [ ets:match_delete(rpz_hotcache_table,{{pkthotcache,X#rpz.zone,'_'},'_','_'}) || X <- RPZ_D ++ RPZ_UPD ],
 
-  ioc2rpz_db:clean_DB(RPZ_D), %TODO check  % ++ RPZ_UPD - should be updated via standard AXFR update.
+  ioc2rpz_db:clean_DB(RPZ_D), %Remove deleted zones 
 
   [ ets:update_element(cfg_table, [rpz,X#rpz.zone], [{3, X#rpz{status=forceAXFR}}]) || X <- RPZ_UPD ], %forceaxfr
 

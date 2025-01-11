@@ -48,7 +48,7 @@
 %%%%%%
 %%%%%% Do not modify any settings below the line
 %%%%%%
--define(ioc2rpz_ver, "1.2.1.0-2024071801").
+-define(ioc2rpz_ver, "1.3.0.0-2025011001").
 
 -define(ZNameZip,16#c00c:16). %Zone name/original fqdn from a request is always at byte 10 in the response
 -define(ZNameZipN,16#c00c). % Offset in bytes - Zone name/original fqdn from a request is always at byte 10 in the response
@@ -134,3 +134,11 @@
 
 %user restriction
 -record(user, {userid,max_ioc,max_wl}). %max # of IOCs and WL entries
+
+%optimization
+-define(TCP_SEND_TIMEOUT,5000). % 5 seconds
+
+%rate limiting
+-define(RATE_LIMIT_TABLE, rate_limits).
+-define(RATE_LIMIT_WINDOW, 10000). % 10 second window in milliseconds
+-define(MAX_REQUESTS_PER_WINDOW, 1). % Maximum requests per IP per window

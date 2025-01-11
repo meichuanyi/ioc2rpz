@@ -36,10 +36,11 @@ init([_IP,[IPver|_]=Params]) ->
 
 handle_cast(shutdown, State) ->
 %    io:format("Generic cast handler: *shutdown* while in '~p'~n",[State]),
-    {stop, normal, State};
+  gen_udp:close(State#state.socket),
+  {stop, normal, State};
 
 handle_cast(_Msg, State) ->
-    {noreply, State}.
+  {noreply, State}.
 
 handle_info({udp, Socket, RIP, RPort, Pkt}, State) ->
     spawn(ioc2rpz,parse_dns_request,[Socket, Pkt, #proto{proto=udp, rip=RIP, rport=RPort}]),

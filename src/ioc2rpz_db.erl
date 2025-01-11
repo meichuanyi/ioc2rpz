@@ -64,8 +64,14 @@ db_table_info(mnesia,Table,Param) ->
 read_db_pkt(Zone) -> %axfr
   read_db_pkt(?DBStorage,Zone).
 read_db_pkt(ets,Zone) ->
-  Pkt = ets:match(rpz_axfr_table,{{rpz,Zone#rpz.zone,Zone#rpz.serial,'_','_'},'$2'}),
-  [binary_to_term(X) || [X] <- Pkt];
+%  Pkt = ets:match(rpz_axfr_table,{{rpz,Zone#rpz.zone,Zone#rpz.serial,'_','_'},'$2'}),
+%  [binary_to_term(X) || [X] <- Pkt];
+
+% 2025-01-11 There is a bug that multiple processes can save the zone at the same time. The following validation is done only as a saveguard. It may be removed when the bug is fixed
+  Pkt = ets:match(rpz_axfr_table,{{rpz,Zone#rpz.zone,Zone#rpz.serial,'_','$1'},'$2'}),
+  [[PID, _] | _]=Pkt,
+  [binary_to_term(X) || [PPID, X] <- Pkt, PPID == PID];
+
 read_db_pkt(mnesia,_Zone) ->
   ok.
 
@@ -236,9 +242,9 @@ ok.
 clean_DB(RPZ) ->
   AXFR=get_allzones_info(ets,axfr),
   RPZn = [X#rpz.zone || X <- RPZ ],
-  [{?logDebugMSG("Zone ~p removing from AXFR cache ~n",[Y]), delete_db_pkt(#rpz{zone=X,zone_str=Y,serial=42}),delete_old_db_record(#rpz{zone=X,zone_str=Y,serial=42})} || [X,Y|_] <- AXFR, lists:member(X, RPZn) ], %looks like was a bug -->>>> not lists:member
+  [{?logDebugMSG("Zone ~p removing from AXFR cache ~n",[Y]), delete_db_pkt(#rpz{zone=X,zone_str=Y,serial=42}),delete_old_db_record(#rpz{zone=X,zone_str=Y,serial=42})} || [X,Y|_] <- AXFR, lists:member(X, RPZn) ],
   IXFR=get_allzones_info(ets,ixfr),
-  [{?logDebugMSG("Zone ~p removing from IXFR cache ~n",[Y]), delete_db_pkt(#rpz{zone=X,zone_str=Y,serial=42}),delete_old_db_record(#rpz{zone=X,zone_str=Y,serial=42})} || [X,Y|_] <- IXFR, lists:member(X, RPZn) ]. %looks like was a bug -->>>> not lists:member
+  [{?logDebugMSG("Zone ~p removing from IXFR cache ~n",[Y]), delete_db_pkt(#rpz{zone=X,zone_str=Y,serial=42}),delete_old_db_record(#rpz{zone=X,zone_str=Y,serial=42})} || [X,Y|_] <- IXFR, lists:member(X, RPZn) ]. 
 
 get_zone_info(Zone,DB) ->
   get_zone_info(?DBStorage,Zone,DB).

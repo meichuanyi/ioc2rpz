@@ -225,15 +225,26 @@ parse_dns_request(Socket, <<DNSId:2/binary, _:1, OptB:7, _:1, OptE:3, _:4, QDCOU
   ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(102),[ip_to_str(Proto#proto.rip),Proto#proto.rport,?iif(Proto#proto.tls == yes,tls,Proto#proto.proto),QStr, ioc2rpz_fun:q_type(QType), ioc2rpz_fun:q_class(QClass)]),
   send_REQST(Socket, DNSId, <<1:1,OptB:7, 0:1, OptE:3,?SERVFAIL:4>>, <<QDCOUNT:2,ANCOUNT:2,NSCOUNT:2,ARCOUNT:2>>, Rest, [], Proto);
 
-parse_dns_request(Socket, <<PH:4/bytes, _QDCOUNT:2/big-unsigned-unit:8,_ANCOUNT:2/big-unsigned-unit:8,_NSCOUNT:2/big-unsigned-unit:8,_ARCOUNT:2/big-unsigned-unit:8, Rest/binary>> = Data, Proto = #proto{rip = Rip}) ->
+parse_dns_request(Socket, <<PH:4/bytes, _QDCOUNT:2/big-unsigned-unit:8,_ANCOUNT:2/big-unsigned-unit:8,NSCOUNT:2/big-unsigned-unit:8,ARCOUNT:2/big-unsigned-unit:8, Rest/binary>> = Data, Proto = #proto{rip = Rip}) ->
   <<DNSId:2/binary, _:1, OptB:7, _:1, OptE:3, _:4>> = PH,
-  {<<QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8, _Other_REC/binary>>,QName} = extract_label(Rest,<<>>),
+  {<<QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8, Other_REC/binary>>,QName} = extract_label(Rest,<<>>),
   Question = <<QName/binary,0:8,QType:2/big-unsigned-unit:8,QClass:2/big-unsigned-unit:8>>,
   QStr=dombin_to_str(QName),
   case ioc2rpz_fun:check_rate_limit({Rip,QName,QType}) of
       true -> % Rate limit exceeded - send refused
         ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(429),[ip_to_str(Proto#proto.rip),Proto#proto.rport,?iif(Proto#proto.tls == yes,tls,Proto#proto.proto),QStr,ioc2rpz_fun:q_type(QType), ioc2rpz_fun:q_class(QClass)]), % Log rate limiting event
         send_REQST(Socket, DNSId, <<1:1,OptB:7, 0:1, OptE:3,?REFUSED:4>>, <<1:16,0:16,0:16,0:16>>, Question, [], Proto);
+% 2025-01-11 A client (dig) expects a signed response. It may be not needed at all - to check RFC
+%        case ARCOUNT of 
+%          0 ->
+%            send_REQST(Socket, DNSId, <<1:1,OptB:7, 0:1, OptE:3,?REFUSED:4>>, <<1:16,0:16,0:16,0:16>>, Question, [], Proto);
+%          _ ->
+%            {_RRRes,_DNSRR,TSIG,_SOA,_RAWN} = parse_rr(NSCOUNT, ARCOUNT, Other_REC),
+%            Opt = <<1:1,OptB:7, 0:1, OptE:3,?REFUSED:4>>,
+%            RH = <<1:16,0:16,0:16,1:16>>, 
+%            {ok,TSIGRR,_}=add_TSIG(list_to_binary([DNSId, Opt, RH, Question]),TSIG),
+%            send_REQST(Socket, DNSId, Opt, RH, Question, TSIGRR, Proto)
+%          end;
       false -> % Rate limit not exceeded, process the request
         %2025-01-10 TODO optimize passing processed data
         process_dns_request(Socket, Data, Proto)

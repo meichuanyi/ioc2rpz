@@ -394,8 +394,12 @@ read_config3([],reload,Srv,Keys,_Key_Groups,WhiteLists,Sources,RPZ)  ->
   [ ioc2rpz_fun:logMessage("Zone ~p was added.~n",[X#rpz.zone_str]) || X <- RPZ_N ],
   [ ioc2rpz_fun:logMessage("Zone ~p was updated.~n",[X#rpz.zone_str]) || X <- RPZ_UPD ],
   [ ioc2rpz_fun:logMessage("Zone ~p was removed.~n",[X#rpz.zone_str]) || X <- RPZ_D ],
-
-  update_all_zones(false),
+  
+  %%%2025-01-11 
+  %%% 
+  %%% to avoid race conditions, commenting this line out. By default all zones should be updated by a scheduler every 60 seconds
+  %%% 
+  %update_all_zones(false),
   ok;
 
 read_config3([],include,Srv,Keys,Key_Groups,WhiteLists,Sources,RPZ)  ->
@@ -505,8 +509,9 @@ update_all_zones(true) -> %force update all zones
 update_all_zones(false) -> %update expired zones
   CTime=ioc2rpz_fun:curr_serial(),%erlang:system_time(seconds),
   AllRPZ = ets:match(cfg_table,{[rpz,'_'],'_','$4'}),
+  [ioc2rpz_fun:logMessage("update_all_zones(false). Start full zone update Zone ~p serial ~p full refresh time ~p, Ctime ~p cache ~p status ~p ~n",[X#rpz.zone_str,X#rpz.ixfr_update_time, X#rpz.ixfr_time,CTime, X#rpz.cache, X#rpz.status]) || [X] <- AllRPZ,((((X#rpz.update_time + X#rpz.axfr_time) < CTime) and ((X#rpz.status /= updating) or ((X#rpz.status == updating) and not my_process_is_alive(X#rpz.pid)) )) or (X#rpz.status == forceAXFR)) and (X#rpz.cache == <<"true">>)],
   [ spawn_opt(ioc2rpz_sup,update_zone_full,[X],[{fullsweep_after,0}]) || [X] <- AllRPZ,((((X#rpz.update_time + X#rpz.axfr_time) < CTime) and ((X#rpz.status /= updating) or ((X#rpz.status == updating) and not my_process_is_alive(X#rpz.pid)) )) or (X#rpz.status == forceAXFR)) and (X#rpz.cache == <<"true">>) ],
-  [ioc2rpz_fun:logMessage("Start incremental update Zone ~p serial ~p full refresh time ~p, Ctime ~p cache ~p status ~p ~n",[X#rpz.zone_str,X#rpz.ixfr_update_time, X#rpz.ixfr_time,CTime, X#rpz.cache, X#rpz.status]) || [X] <- AllRPZ, ((X#rpz.update_time + X#rpz.axfr_time) > CTime) and ((X#rpz.ixfr_update_time + X#rpz.ixfr_time) < CTime) and (X#rpz.cache == <<"true">>) and (X#rpz.status /= updating) and (X#rpz.ixfr_time /= 0)],
+  [ioc2rpz_fun:logMessage("update_all_zones(false). Start incremental update Zone ~p serial ~p full refresh time ~p, Ctime ~p cache ~p status ~p ~n",[X#rpz.zone_str,X#rpz.ixfr_update_time, X#rpz.ixfr_time,CTime, X#rpz.cache, X#rpz.status]) || [X] <- AllRPZ, ((X#rpz.update_time + X#rpz.axfr_time) > CTime) and ((X#rpz.ixfr_update_time + X#rpz.ixfr_time) < CTime) and (X#rpz.cache == <<"true">>) and (X#rpz.status /= updating) and (X#rpz.ixfr_time /= 0)],
   [ spawn_opt(ioc2rpz_sup,update_zone_inc,[X],[{fullsweep_after,0}]) || [X] <- AllRPZ, ((X#rpz.update_time + X#rpz.axfr_time) > CTime) and ((X#rpz.ixfr_update_time + X#rpz.ixfr_time) < CTime) and (X#rpz.cache == <<"true">>) and (X#rpz.status /= updating) and (X#rpz.ixfr_time /= 0) ],
 	ok.
 

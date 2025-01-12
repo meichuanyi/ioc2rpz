@@ -81,11 +81,13 @@ handle_cast(accept, State = #state{socket=ListenSocket, tls=yes, params=[Pid,Pro
                   ioc2rpz_fun:logMessage("~p:~p:~p. TLS handshake error: ~p ~n",
                                         [?MODULE, ?FUNCTION_NAME, ?LINE, HandshakeReason]),
                   ssl:close(TLSTransportSocket), % Close the transport socket
+                  ioc2rpz_proc_sup:start_socket(Proc),
                   {stop, HandshakeReason, State} % Stop the worker
           end;
       {error, AcceptReason} ->
           ioc2rpz_fun:logMessage("~p:~p:~p. TLS accept error: ~p ~n",
                                 [?MODULE, ?FUNCTION_NAME, ?LINE, AcceptReason]),
+          ioc2rpz_proc_sup:start_socket(Proc),
           {stop, AcceptReason, State} % Stop the worker
   end;
 

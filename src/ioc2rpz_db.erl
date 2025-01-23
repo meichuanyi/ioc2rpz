@@ -78,7 +78,7 @@ read_db_pkt(mnesia,_Zone) ->
 write_db_pkt(Zone, Pkt) ->
   write_db_pkt(?DBStorage, Zone, Pkt).
 write_db_pkt(ets, Zone, {PktN,_ANCOUNT,_NSCOUNT,_ARCOUNT,_Records} = Pkt) ->
-  ets:insert(rpz_axfr_table, {{rpz,Zone#rpz.zone,Zone#rpz.serial,PktN,self()}, term_to_binary(Pkt,[{compressed,?Compression}])});
+  ets:insert(rpz_axfr_table, {{rpz,Zone#rpz.zone,Zone#rpz.serial,PktN,erlang:process_info(self(), parent)}, term_to_binary(Pkt,[{compressed,?Compression}])});
 write_db_pkt(mnesia, _Zone, _Pkt) ->
   ok.
 

@@ -918,6 +918,7 @@ send_packets(Socket,[], Pkt, ACount, _PSize, _Zip, PktH, Questions, SOAREC,NSREC
     true -> ok
   end,
   if (DBOp == cache) or (DBOp == sendNcache) ->
+%    ioc2rpz_fun:logMessage("Evoke write, PID ~p  ~n",[self()]),
     ioc2rpz_db:write_db_pkt(Zone, {PktN,ACount,0,0, Pkt});
     true -> ok
   end,
@@ -943,6 +944,7 @@ send_packets(Socket,Tail, Pkt, ACount, PSize, Zip, PktH, Questions, SOAREC,NSRec
     true -> SendStatus = ok
   end,
   if (DBOp == cache) or (DBOp == sendNcache) ->
+%    ioc2rpz_fun:logMessage("Evoke write, PID ~p  ~n",[self()]),
     ioc2rpz_db:write_db_pkt(Zone, {PktN,ACount,0,0, Pkt});
     true -> ok
   end,

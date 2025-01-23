@@ -1,5 +1,8 @@
 # ioc2rpz change log
 [CB] - Changed Behaviour
+## 2025-01-22 v1.3.0.1
+- FIX BUG #52 (https://github.com/Homas/ioc2rpz/issues/52)
+
 ## 2025-01-10 v1.3.0.0
 - Query rate limiting
 

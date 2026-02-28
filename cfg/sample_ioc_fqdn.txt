@@ -1,0 +1,16 @@
+# Sample IOC source — FQDN indicators (no expiration)
+# One indicator per line. Lines starting with # are not indicators
+# but will be filtered out by regex.
+# Uses example.com subdomains per RFC 2606.
+malware.example.com
+botnet-c2.example.com
+phishing-login.example.com
+dga-seed01.example.com
+dga-seed02.example.com
+exploit-kit.example.com
+ransomware-drop.example.com
+cryptominer.example.com
+adware-tracker.example.com
+spyware-beacon.example.com
+data-exfil.example.com
+fast-flux.example.com

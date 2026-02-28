@@ -1,0 +1,20 @@
+# Sample IOC source — IP indicators (no expiration)
+# Uses TEST-NET ranges (RFC 5737) and documentation IPv6 (RFC 3849).
+# These addresses are reserved for documentation and will never route.
+#
+# IPv4 — TEST-NET-1: 192.0.2.0/24
+# IPv4 — TEST-NET-2: 198.51.100.0/24
+# IPv4 — TEST-NET-3: 203.0.113.0/24
+# IPv6 — Documentation: 2001:db8::/32
+192.0.2.10
+192.0.2.11
+192.0.2.50
+198.51.100.1
+198.51.100.22
+198.51.100.100
+203.0.113.5
+203.0.113.42
+203.0.113.200
+2001:db8::1
+2001:db8::bad:c0de
+2001:db8:1::100

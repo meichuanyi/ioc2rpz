@@ -12,7 +12,17 @@
 %See the License for the specific language governing permissions and
 %limitations under the License.
 
-%IOC2RPZ TCP Worker
+%% @doc IOC2RPZ TCP/TLS Worker Module.
+%%
+%% This module implements a gen_server-based worker for accepting and processing
+%% DNS queries over TCP and TLS (DNS over TLS / DoT) connections. Each worker
+%% is spawned by a simple_one_for_one supervisor and handles a single connection
+%% lifecycle: accept, receive DNS query, process, respond, and terminate.
+%%
+%% The module also contains core DNS processing logic including RPZ zone transfers
+%% (AXFR/IXFR), TSIG authentication, SOA responses, rate limiting integration,
+%% RPZ rule generation, DNS notify, and IOC-to-RPZ conversion.
+%% @end
 
 -module(ioc2rpz).
 -include_lib("eunit/include/eunit.hrl").
@@ -26,9 +36,18 @@
 
 %-compile([export_all]).
 
+%% @doc Starts a linked gen_server worker for a given listen socket.
+%% @param Socket The listen socket (TCP or TLS) to accept connections on.
+%% @param Params A list `[Pid, Proc, TLS]' where Pid is the supervisor PID,
+%%        Proc is the process supervisor name, and TLS is `yes' or `no'.
+%% @returns `{ok, Pid}' on success.
 start_ioc2rpz(Socket,Params) ->
   gen_server:start_link(?MODULE, [Socket,Params], []).
 
+%% @doc Initializes the gen_server worker state and triggers an async accept.
+%% Immediately casts an `accept' message to self to begin the accept loop.
+%% @param Args A list `[Socket, [Pid, Proc, TLS]]'.
+%% @returns `{ok, #state{}}' with the listen socket and connection parameters.
 init([Socket,[Pid,Proc,TLS]]) ->
   ?logDebugMSG("ioc2rpz ~p child started ~n", [Proc]),
   gen_server:cast(self(), accept),
@@ -58,6 +77,13 @@ init([Socket,[Pid,Proc,TLS]]) ->
 
 %%% Improved accept handling 2025-01-07. In case of a error, why we don't start a new socket?
 %%%TCP accept
+%% @doc Handles the `accept' cast for TCP (non-TLS) connections.
+%% Blocks on `gen_tcp:accept/1' waiting for an incoming TCP connection.
+%% On success, spawns a replacement listener via `ioc2rpz_proc_sup:start_socket/1'
+%% and transitions to the connected state. On error, logs the reason and stops
+%% the worker process.
+%% @param State The gen_server state containing the listen socket.
+%% @returns `{noreply, State}' on successful accept, `{stop, Reason, State}' on error.
 handle_cast(accept, State = #state{socket=ListenSocket, tls=no, params=[Pid,Proc]}) ->
   case gen_tcp:accept(ListenSocket) of
       {ok, AcceptSocket} ->
@@ -70,6 +96,14 @@ handle_cast(accept, State = #state{socket=ListenSocket, tls=no, params=[Pid,Proc
   end;
 
 %%%TLS accept
+%% @doc Handles the `accept' cast for TLS (DoT) connections.
+%% Performs a two-phase accept: first `ssl:transport_accept/1' to accept the
+%% raw TCP connection, then `ssl:handshake/2' to complete the TLS negotiation.
+%% On success, spawns a replacement listener. On handshake or accept failure,
+%% logs the error, closes the transport socket if applicable, spawns a
+%% replacement listener, and stops the worker.
+%% @param State The gen_server state containing the TLS listen socket.
+%% @returns `{noreply, State}' on success, `{stop, Reason, State}' on error.
 handle_cast(accept, State = #state{socket=ListenSocket, tls=yes, params=[Pid,Proc]}) ->
   case ssl:transport_accept(ListenSocket) of
       {ok, TLSTransportSocket} ->
@@ -94,6 +128,14 @@ handle_cast(accept, State = #state{socket=ListenSocket, tls=yes, params=[Pid,Pro
 handle_cast(_, State) ->
   {noreply, State}.
 
+%% @doc Handles incoming TCP data from an accepted connection.
+%% Strips the 2-byte DNS TCP length prefix, resolves the remote peer address,
+%% dispatches the DNS query to `parse_dns_request/3', closes the socket, and
+%% stops the worker process (one query per connection).
+%% @param Socket The accepted TCP connection socket.
+%% @param Pkt The raw TCP data including the 2-byte length prefix.
+%% @param State The gen_server state.
+%% @returns `{stop, normal, State}' after processing and closing the socket.
 handle_info({tcp, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socket=_ListenSocket, params=_Params}) ->
 
   %HCS = ioc2rpz_sup:db_table_info(ets,rpz_hotcache_table,memory) * 8,
@@ -116,6 +158,14 @@ handle_info({tcp, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socke
   %  fprof:trace(stop),
   {stop, normal , State}; 
 
+%% @doc Handles incoming TLS data from an accepted DoT connection.
+%% Strips the 2-byte DNS TCP length prefix, resolves the remote peer address
+%% via `ssl:peername/1', dispatches the DNS query to `parse_dns_request/3',
+%% closes the TLS socket, and stops the worker process.
+%% @param Socket The accepted TLS connection socket.
+%% @param Pkt The raw TLS data including the 2-byte length prefix.
+%% @param State The gen_server state.
+%% @returns `{stop, normal, State}' after processing and closing the socket.
 handle_info({ssl, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socket=_ListenSocket, params=_Params}) ->
 %  fprof:trace(start),
   {ok,{R_ip,R_port}}=ssl:peername(Socket),
@@ -128,29 +178,50 @@ handle_info({ssl, Socket, <<_:2/binary,Pkt1/binary>>=_Pkt}, State = #state{socke
 %  fprof:trace(stop),
   {stop, normal , State};
 
+%% @doc Handles TCP connection closed events. Stops the worker normally.
 handle_info({tcp_closed, _Socket}, State) ->
   {stop, normal, State};
+%% @doc Handles TCP error events. Stops the worker normally.
 handle_info({tcp_error, _Socket, _}, State) ->
   {stop, normal, State};
 
+%% @doc Handles TLS connection closed events. Stops the worker normally.
 handle_info({ssl_closed, _Socket}, State) ->
   {stop, normal, State};
+%% @doc Handles TLS error events. Stops the worker normally.
 handle_info({ssl_error, _Socket, _}, State) ->
   {stop, normal, State};
 
+%% @doc Catch-all handler for unexpected messages. Logs the message and continues.
 handle_info(Msg, State) ->
   ioc2rpz_fun:logMessage("Unexpected message: ~p, State: ~p~n", [Msg, State]),
   {noreply, State}.
 
+%% @doc Handles synchronous calls. Currently a no-op; returns `{noreply, State}'.
 handle_call(_E, _From, State) ->
 %  io:format("ioc2rpz accept connection~n"),
   {noreply, State}.
+
+%% @doc Terminates the gen_server worker. Performs no cleanup actions.
+%% @param Reason The termination reason.
+%% @param Tab The gen_server state.
+%% @returns `ok'.
 terminate(_Reason, _Tab) ->
 %  ioc2rpz_db:tab2file([]),
   ok.
+
+%% @doc Handles hot code upgrades. Returns the state unchanged.
 code_change(_OldVersion, Tab, _Extra) ->
   {ok, Tab}.
 
+%% @doc Dispatches a DNS packet to the appropriate transport-specific send function.
+%% Routes to `send_dns_tcp/3', `send_dns_tls/3', or `send_dns_udp/5' based on
+%% the protocol and TLS flag in the Proto record.
+%% @param Socket The connection socket.
+%% @param Pkt The DNS response packet binary.
+%% @param ProtoArgs A list `[Proto, Args]' where Proto is a `#proto{}' record
+%%        and Args is `addlen' or `[]'.
+%% @returns `ok' on success, `{ok, Pkt}' for DoH, or `{error, Reason}' on failure.
 %% Send a message back to the client
 send_dns(Socket,Pkt,[Proto,Args]) when Proto#proto.proto == tcp, Proto#proto.tls == no ->
   case send_dns_tcp(Socket,Pkt, Args) of
@@ -173,6 +244,14 @@ send_dns(_Socket,Pkt,[Proto,_Args]) when Proto#proto.proto == doh ->
 send_dns(Socket,Pkt,[Proto,Args]) when Proto#proto.proto == udp ->
   send_dns_udp(Socket, Proto#proto.rip, Proto#proto.rport, Pkt, Args).
 
+%% @doc Sends a DNS response over a TCP socket.
+%% When Args is `addlen', prepends the 2-byte DNS TCP length prefix to the packet.
+%% When Args is `[]', sends the packet as-is (intermediate packet in a multi-packet
+%% zone transfer). After a successful send, re-arms the socket with `{active, once}'.
+%% @param Socket The TCP connection socket.
+%% @param Pkt The DNS response packet binary.
+%% @param Args `addlen' for first/only packet, `[]' for intermediate packets.
+%% @returns `ok' on success, `{error, Reason}' on send failure.
 send_dns_tcp(Socket, Pkt, addlen) -> %used to send the first or an only packet
 case gen_tcp:send(Socket, [<<(byte_size(Pkt)):16>>,Pkt]) of
   ok -> inet:setopts(Socket, [{active, once}]); %TODO validate the response, if dropped - pass back to remove cached zone
@@ -185,6 +264,15 @@ send_dns_tcp(Socket, Pkt, []) -> %used to pass intermediate packets
     {error, Reason} -> {error, Reason} %passing a reason if send was failed
 end.
 
+%% @doc Sends a DNS response over a TLS socket.
+%% When Args is `addlen', prepends the 2-byte DNS TCP length prefix.
+%% When Args is `[]', sends the packet as-is for intermediate zone transfer packets.
+%% After sending, re-arms the socket with `{active, once}'.
+%% Note: Return values from `ssl:send/2' and `ssl:setopts/2' are currently not checked.
+%% @param Socket The TLS connection socket.
+%% @param Pkt The DNS response packet binary.
+%% @param Args `addlen' for first/only packet, `[]' for intermediate packets.
+%% @returns The result of `ssl:setopts/2' (typically `ok').
 send_dns_tls(Socket, Pkt, addlen) -> %used to send the first or an only packet
   ssl:send(Socket, [<<(byte_size(Pkt)):16>>,Pkt]),
 % The connection will not be reused and a child will be terminated
@@ -197,9 +285,30 @@ send_dns_tls(Socket, Pkt, []) -> %used to pass intermediate packets
 % TODO check compliance with DoT
   ssl:setopts(Socket, [{active, once}]).
 
+%% @doc Sends a DNS response over UDP.
+%% Delegates directly to `gen_udp:send/4'. The return value is currently not checked.
+%% @param Socket The UDP socket.
+%% @param Dst The destination IP address tuple.
+%% @param Port The destination port number.
+%% @param Pkt The DNS response packet binary.
+%% @param Args Unused arguments (reserved for future use).
+%% @returns The result of `gen_udp:send/4'.
 send_dns_udp(Socket, Dst, Port, Pkt, _Args) ->
   gen_udp:send(Socket, Dst, Port, Pkt).
 
+%% @doc Parses and validates an incoming DNS request, applying rate limiting.
+%% This is the main entry point for DNS query processing. It performs:
+%% - Packet size validation (rejects packets of 12 bytes or fewer)
+%% - DDoS detection (rejects queries from DNS ports 53/853)
+%% - QR bit check (drops responses masquerading as queries)
+%% - QDCOUNT validation (rejects multi-question queries)
+%% - Per-IP/query rate limiting via `ioc2rpz_fun:check_rate_limit/1'
+%% - Delegation to `process_dns_request/3' for valid queries
+%%
+%% @param Socket The connection socket (TCP, TLS, or UDP).
+%% @param Data The raw DNS query binary (without TCP length prefix).
+%% @param Proto A `#proto{}' record with protocol type, TLS flag, remote IP/port.
+%% @returns Side-effectful; sends DNS responses via `send_dns/3'. No meaningful return.
 parse_dns_request(_Socket, Data, Proto) when byte_size(Data) =< 12 ->
 %%% Bad DNS packet
   ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(101),[ip_to_str(Proto#proto.rip),Proto#proto.rport,?iif(Proto#proto.tls == yes,tls,Proto#proto.proto)]);
@@ -252,6 +361,18 @@ parse_dns_request(Socket, <<PH:4/bytes, _QDCOUNT:2/big-unsigned-unit:8,_ANCOUNT:
         process_dns_request(Socket, Data, Proto)
   end.
 
+%% @doc Processes a validated DNS request after rate limiting.
+%% Extracts the query name, type, class, and resource records (TSIG, SOA, OPT).
+%% Routes the request based on query type and zone:
+%% - Management commands (ioc2rpz-status, ioc2rpz-reload-cfg, etc.) via CHAOS TXT
+%% - Sample zone transfers (sample-zone.ioc2rpz)
+%% - RPZ zone SOA queries and zone transfers (AXFR/IXFR)
+%% - TSIG authentication is validated for all protected operations.
+%%
+%% @param Socket The connection socket.
+%% @param Data The raw DNS query binary.
+%% @param Proto A `#proto{}' record with connection metadata.
+%% @returns Side-effectful; sends DNS responses. No meaningful return.
 process_dns_request(Socket, <<PH:4/bytes, QDCOUNT:2/big-unsigned-unit:8,ANCOUNT:2/big-unsigned-unit:8,NSCOUNT:2/big-unsigned-unit:8,ARCOUNT:2/big-unsigned-unit:8, Rest/binary>> = _Data, Proto) when QDCOUNT == 1, ANCOUNT == 0 -> %_DataLen:2/big-unsigned-unit:8,
   STime=erlang:system_time(millisecond), %nanosecond, microsecond, millisecond, second
   <<DNSId:2/binary, _:1, OptB:7, _:1, OptE:3, _:4>> = PH,
@@ -405,6 +526,27 @@ process_dns_request(Socket, <<PH:4/bytes, QDCOUNT:2/big-unsigned-unit:8,ANCOUNT:
   end.
 
 
+%% @doc Sends a TSIG authentication error response to the client.
+%% Handles multiple TSIG error types with appropriate DNS response codes and
+%% CEF log messages:
+%% - `notsig': Request was not signed; returns REFUSED.
+%% - `keynotfound': TSIG key name not found; returns NOTAUTH with TSIG_BADKEY.
+%% - `badmac': TSIG MAC validation failed; returns NOTAUTH with TSIG_BADSIG.
+%% - `badtimegoodmac': Valid MAC but timestamp out of fudge window; returns
+%%   NOTAUTH with TSIG_BADTIME and includes server time for clock sync.
+%% - Catch-all: Returns SERVFAIL for any other TSIG error.
+%%
+%% @param ErrorType The TSIG error atom (`notsig', `keynotfound', `badmac',
+%%        `badtimegoodmac', or any other term).
+%% @param Socket The connection socket.
+%% @param DNSId The 2-byte DNS transaction ID.
+%% @param OptB The 7-bit opcode/flags byte from the DNS header.
+%% @param OptE The 3-bit extended flags from the DNS header.
+%% @param Question The DNS question section binary.
+%% @param TSIG The `#dns_TSIG_RR{}' record from the request.
+%% @param Info A list `[MSG, TSGV, QStr, QType, QClass]' with error context.
+%% @param Proto The `#proto{}' record with connection metadata.
+%% @returns The result of `send_REQST/7'.
 send_TSIG_error(notsig, Socket, DNSId, OptB, OptE, Question, _TSIG, [MSG,_TSGV,QStr, QType, QClass], Proto) ->
  %%% request not signed
   ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(103),[ip_to_str(Proto#proto.rip),Proto#proto.rport,?iif(Proto#proto.tls == yes,tls,Proto#proto.proto),QStr, ioc2rpz_fun:q_type(QType), ioc2rpz_fun:q_class(QClass),"",MSG]),
@@ -440,6 +582,26 @@ send_TSIG_error(_, Socket, DNSId, OptB, OptE, Question, TSIG, [MSG,MSPG,QStr, QT
   send_REQST(Socket, DNSId, <<1:1,OptB:7, 0:1, OptE:3,?SERVFAIL:4>>, <<1:16,0:16,0:16,0:16>>, Question, [], Proto).
 
 
+%% @doc Validates a DNS request's TSIG authentication.
+%% Checks whether the request is signed, whether the TSIG key exists in the
+%% server's key table and is authorized for the zone, computes the HMAC over
+%% the request packet, and validates the MAC and timestamp.
+%%
+%% @param PH The 4-byte DNS packet header.
+%% @param QDCOUNT Question count.
+%% @param ANCOUNT Answer count.
+%% @param NSCOUNT Authority count.
+%% @param ARCOUNT Additional count (minus 1 for the TSIG RR).
+%% @param Question The DNS question section binary.
+%% @param DNSRR The raw resource records binary (excluding TSIG).
+%% @param TSIG The `#dns_TSIG_RR{}' record parsed from the request.
+%% @param KEYS A list of authorized TSIG key names for this zone/operation.
+%% @returns `{notsig, []}' if unsigned and no keys required,
+%%          `{noauth, []}' if unsigned and keys are required,
+%%          `{valid, TSIG}' if MAC and timestamp are valid,
+%%          `{badmac, []}' if MAC is invalid,
+%%          `{badtimegoodmac, TSIG}' if MAC is valid but timestamp is out of range,
+%%          `{keynotfound, TSIG}' if the key name is not in the server's key table.
 validate_REQ(_PH,_QDCOUNT,_ANCOUNT,_NSCOUNT,_ARCOUNT,_Question,_DNSRR,TSIG, KEYS)  when TSIG#dns_TSIG_RR.name == <<>>, KEYS /= [] ->
   {notsig,[]};
 
@@ -469,6 +631,17 @@ validate_REQ(PH,QDCOUNT,ANCOUNT,NSCOUNT,ARCOUNT,Question,DNSRR,TSIG, KEYS) when 
         {keynotfound,TSIG}
   end.
 
+%% @doc Signs a DNS response packet with TSIG.
+%% Computes the HMAC over the packet concatenated with TSIG metadata fields,
+%% using the algorithm and key from the TSIG record. Supports md5, sha256,
+%% and sha512 algorithms. Returns the TSIG resource record binary and an
+%% updated TSIG record with the new MAC for subsequent packet signing
+%% (time_only mode for multi-packet zone transfers).
+%%
+%% @param Pkt The DNS response packet binary to sign.
+%% @param TSIG The `#dns_TSIG_RR{}' record with key, algorithm, and timing info.
+%% @returns `{ok, TSIGBinary, UpdatedTSIG}' where TSIGBinary is the TSIG RR
+%%          to append to the DNS packet.
 %Sign the packet
 add_TSIG(Pkt, TSIG) ->
   if TSIG#dns_TSIG_RR.time_only == true ->
@@ -488,6 +661,15 @@ add_TSIG(Pkt, TSIG) ->
   DLEN=byte_size(DATA),
   {ok,<<(TSIG#dns_TSIG_RR.name)/binary,0:8,250:8,0:8,255:8,0:32,DLEN:2/big-unsigned-unit:8,DATA/binary>>,TSIG#dns_TSIG_RR{mac_len=MAC_LEN,mac=MAC,time_only=true,time=LTime}}. %END Sign the packet
 
+%% @doc Parses DNS resource records (authority and additional sections).
+%% Extracts TSIG, SOA, OPT, and other RR types from the raw binary.
+%% Returns the parsed records, the TSIG record (if present), the SOA record
+%% (if present), and the raw RR data (excluding TSIG) for MAC computation.
+%%
+%% @param NSCOUNT The number of authority section records.
+%% @param ARCOUNT The number of additional section records.
+%% @param RAW The raw binary of the resource records.
+%% @returns `{ok | badTSIGposition, RRList, #dns_TSIG_RR{}, #dns_SOA_RR{}, RawBinary}'.
 %%%
 %%% Parse resourse records
 %%%
@@ -552,6 +734,16 @@ parse_rr(NSCOUNT, ARCOUNT, <<_Zip:8,_/binary>> = RAW, RR, SOA, RAWN) ->
 
 
 
+%% @doc Sends a SERVFAIL, REFUSED, NXDOMAIN, or other error/status DNS response.
+%% Optionally signs the response with TSIG if a TSIG record is provided.
+%% @param Socket The connection socket.
+%% @param DNSId The 2-byte DNS transaction ID.
+%% @param Opt The DNS header flags binary (QR=1, opcode, rcode).
+%% @param RH The record counts binary (QD, AN, NS, AR).
+%% @param Question The DNS question section binary.
+%% @param TSIG The TSIG record for signing, or `[]' for unsigned responses.
+%% @param Proto The `#proto{}' record.
+%% @returns The result of `send_dns/3'.
 %Send SERVFAIL/REFUSED/NXDOMAIN
 send_REQST(Socket, DNSId, Opt, RH, Question, TSIG, Proto) ->
   %Pkt1 = list_to_binary([DNSId, Opt, RH, Rest]), % <<1:1, OptB:7, 1:1, OptE:3, Status:4>>
@@ -570,6 +762,20 @@ send_REQST(Socket, DNSId, Opt, RH, Question, TSIG, Proto) ->
   send_dns(Socket,Pkt1, [Proto,addlen]).
 %END Send SERVFAIL/REFUSED/NXDOMAIN
 
+%% @doc Sends a SOA (Start of Authority) response for an RPZ zone.
+%% Constructs the SOA record from the zone's serial, SOA timers, NS server,
+%% and mail address. Optionally signs with TSIG.
+%% @param Socket The connection socket.
+%% @param Zone The `#rpz{}' record for the queried zone.
+%% @param DNSId The 2-byte DNS transaction ID.
+%% @param OptB The 7-bit opcode/flags byte.
+%% @param OptE The 3-bit extended flags.
+%% @param Question The DNS question section binary.
+%% @param MailAddr The SOA responsible person (rname) in wire format.
+%% @param NSServ The SOA primary nameserver (mname) in wire format.
+%% @param TSIG The TSIG record for signing, or `[]'.
+%% @param Proto The `#proto{}' record.
+%% @returns The result of `send_dns/3'.
 %Send SOA
 send_SOA(Socket, Zone, DNSId, OptB, OptE, Question, MailAddr, NSServ, TSIG, Proto) ->
 
@@ -585,7 +791,25 @@ send_SOA(Socket, Zone, DNSId, OptB, OptE, Question, MailAddr, NSServ, TSIG, Prot
   send_dns(Socket,Pkt1, [Proto,addlen]).
 %END Send SOA
 
-%Send sample zone
+%% @doc Sends the built-in sample RPZ zone as an AXFR response.
+%% Constructs a complete zone transfer containing example RPZ rules for all
+%% supported action types: nxdomain, nodata, passthru, drop, tcp-only,
+%% redirect_domain, redirect_ip (IPv4 and IPv6), IP-based triggers,
+%% nsdname triggers, and nsip triggers. The zone is bookended by SOA records
+%% per the AXFR protocol. Optionally signed with TSIG.
+%%
+%% @param Socket The connection socket.
+%% @param DNSId The 2-byte DNS transaction ID.
+%% @param OptB The 7-bit opcode/flags byte.
+%% @param OptE The 3-bit extended flags.
+%% @param Questions The DNS question section binary.
+%% @param MailAddr The SOA rname in wire format.
+%% @param NSServ The SOA mname in wire format.
+%% @param TSIG The TSIG record for signing, or `[]'.
+%% @param Proto The `#proto{}' record.
+%% @returns The result of `send_dns/3'.
+%% @see gen_rpzrule/5
+%% @end
 send_sample_zone(Socket, DNSId, OptB, OptE, Questions, MailAddr, NSServ, TSIG, Proto) ->
   SOA = <<NSServ/binary,MailAddr/binary,(ioc2rpz_fun:curr_serial()):32,7200:32,3600:32,259001:32,7200:32>>,
   SOAREC = <<?ZNameZip, ?T_SOA:16, ?C_IN:16, 604800:32, (byte_size(SOA)):16, SOA/binary>>,
@@ -641,6 +865,13 @@ send_sample_zone(Socket, DNSId, OptB, OptE, Questions, MailAddr, NSServ, TSIG, P
 
 %END Send sample zone
 
+%% @doc Sends the server status as a DNS TXT response.
+%% Reports ETS table sizes and memory usage for cfg_table, rpz_hotcache_table,
+%% rpz_axfr_table, and rpz_ixfr_table.
+%% @param Socket The connection socket.
+%% @param Args A list `[Question, DNSId, OptB, OptE, TSIG]'.
+%% @param Proto The `#proto{}' record.
+%% @returns The result of `send_txt_response/4'.
 %Send server status
 send_status(Socket,[Question,DNSId,OptB,OptE,TSIG], Proto) ->
   WS = erlang:system_info(wordsize),
@@ -663,6 +894,14 @@ send_status(Socket,[Question,DNSId,OptB,OptE,TSIG], Proto) ->
 
 
 
+%% @doc Sends a DNS TXT response with the given data string.
+%% Splits the data into 254-byte chunks (per DNS TXT record rules) and
+%% constructs a single TXT resource record. Optionally signs with TSIG.
+%% @param Socket The connection socket.
+%% @param Args A list `[Questions, DNSId, OptB, OptE, TSIG]'.
+%% @param Data The TXT record data as a binary string.
+%% @param Proto The `#proto{}' record.
+%% @returns The result of `send_dns/3'.
 %Send TXT response
 send_txt_response(Socket,[Questions,DNSId,OptB,OptE,TSIG],Data, Proto) ->
 %  Multiple TXT records
@@ -682,17 +921,36 @@ send_txt_response(Socket,[Questions,DNSId,OptB,OptE,TSIG],Data, Proto) ->
 
 %END TXT response
 
+%% @doc Generates a single DNS TXT resource record binary from a text binary.
+%% Constructs the record with a compressed name pointer (0xC00C), TXT type,
+%% IN class, default TTL, and the text data in length-prefixed format
+%% (one-octet length prefix followed by the text bytes).
+%% @param TXT Binary containing the text data (max 254 bytes).
+%% @returns A complete DNS TXT resource record as an iodata binary.
 gen_txt_rec(TXT) ->
   Len=byte_size(TXT),
   <<16#c00c:16, ?T_TXT:2/big-unsigned-unit:8, ?C_IN:2/big-unsigned-unit:8, ?TTL:32, (Len+1):16, Len:8, TXT/binary>>.
 
 
+%% @doc Sends DNS NOTIFY messages to all configured secondary servers for a zone.
+%% Spawns a separate process for each notification target. Supports both UDP
+%% and TCP notification transports as configured in `Zone#rpz.notifylist'.
+%% @param Zone The `#rpz{}' record containing the notify list.
+%% @returns A list of spawned process PIDs.
 send_notify(Zone) ->
   %TODO wait for the confirmation
   Pkt = <<0:1, ?OP_NOTIFY, 1:1, 0:6, ?NOERROR:4, 1:16,0:16,0:16,0:16,(Zone#rpz.zone)/binary,?T_SOA:16,?C_IN:16>>,
   [ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(221),[inet:ntoa(IP),53,Proto,Zone#rpz.zone_str]) || {Proto,IP} <- Zone#rpz.notifylist ],
   [ spawn(ioc2rpz,send_notify,[IP,Pkt,Proto,0,Zone#rpz.zone_str]) || {Proto,IP} <- Zone#rpz.notifylist ].
 
+%% @doc Sends a DNS NOTIFY to a single destination via UDP.
+%% Opens a random high port, sends the notify packet, and closes the socket.
+%% Retries up to 3 times on `eaddrinuse' errors.
+%% @param Dst The destination IP address tuple.
+%% @param Pkt The NOTIFY packet binary (without DNS ID).
+%% @param Proto `udp' atom.
+%% @param NRuns The current retry count.
+%% @param Zone The zone name string (for logging).
 send_notify(Dst,Pkt,udp,NRuns,Zone) -> % TODO NRuns - will be used to resend Notify if not confirmation was not received
   Port=rand:uniform(55535)+10000,
   case gen_udp:open(Port, [{active,false}]) of
@@ -705,6 +963,9 @@ send_notify(Dst,Pkt,udp,NRuns,Zone) -> % TODO NRuns - will be used to resend Not
   	{error, Reason} -> {Reason,[]}
   end;
 
+%% @doc Sends a DNS NOTIFY to a single destination via TCP.
+%% Connects to port 53, sends the notify packet with TCP length prefix, and
+%% closes the connection. Retries up to 3 times on `eaddrinuse' errors.
 send_notify(Dst,Pkt,tcp,NRuns,Zone) ->
   case gen_tcp:connect(Dst, 53, [{active, false}], ?TCPTimeout) of
     {ok, Socket} -> DNSId = crypto:strong_rand_bytes(2), send_dns_tcp(Socket, <<DNSId/binary,Pkt/binary>>, addlen), gen_tcp:close(Socket);
@@ -712,6 +973,19 @@ send_notify(Dst,Pkt,tcp,NRuns,Zone) ->
   	{error, Reason} -> ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(222),[Dst,53,"tcp",Zone,Reason]), {Reason,[]}
   end.
 
+%% @doc Sends a cached zone transfer by iterating over pre-built packets.
+%% Prepends SOA and NS records to the first packet, appends SOA to the last,
+%% and signs each packet with TSIG if provided. Used for AXFR/IXFR responses
+%% when the zone is already cached in ETS.
+%% @param Socket The connection socket.
+%% @param NSREC The NS resource record binary.
+%% @param SOAREC The SOA resource record binary.
+%% @param TSIG The TSIG record for signing, or `[]'.
+%% @param PktH The DNS response header binary.
+%% @param Questions The DNS question section binary.
+%% @param Pkts A list of `{PktN, ANCOUNT, NSCOUNT, ARCOUNT, Pkt}' tuples.
+%% @param Proto The `#proto{}' record.
+%% @returns `ok' on success, `{error, Reason}' on send failure.
 send_cached_zone(Socket,NSREC, SOAREC, TSIG, PktH, Questions, Pkts, Proto) -> %created becasue of concurent zone creation
   send_cached_zone(Socket,NSREC, SOAREC, TSIG, PktH, Questions, Pkts,0, Proto).
 
@@ -731,6 +1005,21 @@ send_cached_zone(Socket, NSREC, SOAREC, TSIG, PktH, Questions, [{_PktN,ANCOUNT,N
   	{error, Reason} -> {error, Reason}
   end.
 
+%% @doc Routes a zone transfer request to the appropriate handler.
+%% Dispatches based on cache status, zone readiness, query type (AXFR/IXFR),
+%% and zone serial numbers. Handles:
+%% - Cached AXFR: sends pre-built packets from ETS
+%% - Cached IXFR with same/newer serial: sends SOA-only response
+%% - Cached IXFR with full transfer needed: sends full zone
+%% - Cached IXFR with incremental data: sends add/delete diff
+%% - Not-ready zones: returns SERVFAIL
+%% - Non-cacheable zones: generates and sends live, with hot cache support
+%%
+%% @param Cache `<<"true">>' or other value indicating cache mode.
+%% @param Socket The connection socket.
+%% @param ZoneParams A tuple with all zone transfer parameters.
+%% @param Proto The `#proto{}' record.
+%% @returns `ok' on success, or the result of `send_dns/3'.
 %Return cached zone
 send_zone(<<"true">>,Socket,{Questions,DNSId,OptB,OptE,_RH,_Rest,Zone,?T_AXFR,NSServ,MailAddr,TSIG,_SOA}, Proto) when Zone#rpz.status == ready;Zone#rpz.status == updating,Zone#rpz.serial /= 0 -> %AXFR
 %  ioc2rpz_fun:logMessage("Zone ~p is cached ~p ~p ~n", [Zone#rpz.zone_str, Zone#rpz.serial,Zone#rpz.status ]),
@@ -807,6 +1096,22 @@ send_zone(_,Socket,{Questions,DNSId,OptB,OptE,_RH,_Rest,Zone,_QType,NSServ,MailA
   end,
   ok.
 
+%% @doc Generates and sends a zone transfer live (not from cache).
+%% Fetches IOCs from all configured sources, computes an MD5 hash for change
+%% detection, writes records to the database, and streams the zone transfer
+%% packets to the client. Also manages hot cache storage for non-cacheable zones.
+%%
+%% @param Socket The connection socket.
+%% @param Op The operation type (`cache', `send', `sendNcache', `sendNhotcache').
+%% @param Zone The `#rpz{}' record for the zone.
+%% @param PktH The DNS response header binary.
+%% @param Questions The DNS question section binary.
+%% @param SOAREC The SOA resource record binary.
+%% @param NSRec The NS resource record binary.
+%% @param TSIG The TSIG record for signing, or `[]'.
+%% @param Proto The `#proto{}' record.
+%% @returns `{ok, MD5, NRules, NIOCs}' on success, or
+%%          `{updateSOA, MD5, RuleCount, MaxIOC}' if zone data unchanged.
 send_zone_live(Socket,Op,Zone,PktH,Questions, SOAREC,NSRec,TSIG,Proto) ->
   IOC = mrpz_from_ioc(Zone,axfr),
   MD5=crypto:hash(md5,term_to_binary(IOC)),
@@ -825,6 +1130,11 @@ send_zone_live(Socket,Op,Zone,PktH,Questions, SOAREC,NSRec,TSIG,Proto) ->
       {ok,MD5, NRules, NIOCs}
   end.
 
+%% @doc Waits for a spawned zone packet generation process to complete.
+%% Used in concurrent zone caching where IOCs are split across processes.
+%% @param PID The PID of the spawned process to wait for.
+%% @param Zone The zone name (unused, for debugging).
+%% @returns `{ok, NRules, NIOCs}' from the spawned process.
 w_send_packets(PID, _Zone) ->
   receive
     { ok, PID, {ok, NRules, NIOCs} } ->
@@ -833,7 +1143,44 @@ w_send_packets(PID, _Zone) ->
   end.
 
 
-% пустая зона
+%% @doc Builds and sends DNS zone transfer packets from a list of IOC records.
+%% This is the core packet assembly engine for AXFR/IXFR zone transfers.
+%% It accumulates RPZ rules into packets up to `?DNSPktMax' size, then sends
+%% or caches each packet. Handles:
+%% - Empty zones (sends SOA+NS+SOA)
+%% - First packet initialization with SOA and NS records
+%% - Packet overflow and splitting at `?DNSPktMax' boundary
+%% - IXFR delete/add SOA transitions
+%% - Concurrent caching via process spawning
+%% - TSIG signing of each packet
+%% - Hot cache and ETS packet storage
+%%
+%% Has 20 parameters due to the accumulated state carried through recursion.
+%%
+%% @param Socket The connection socket (or `<<>>' for cache-only mode).
+%% @param IOC The list of `{IOCBinary, Expiry, Type}' tuples to process.
+%% @param Pkt The accumulated packet binary for the current DNS message.
+%% @param ACount The answer record count for the current packet.
+%% @param PSize The current packet payload size.
+%% @param Zip Whether label compression is enabled.
+%% @param PktH The DNS response header binary.
+%% @param Questions The DNS question section binary.
+%% @param SOAREC The current SOA record binary.
+%% @param NSRec The NS record binary (or client SOA for IXFR).
+%% @param Zone The `#rpz{}' record (rule_count and ioc_count are accumulated).
+%% @param MP A compiled regex for IP address detection.
+%% @param PktHLen The header + question length for offset calculations.
+%% @param T_ZIP_L The label compression ETS table ID.
+%% @param TSIG The TSIG record for signing, or `[]'.
+%% @param PktN The current packet sequence number.
+%% @param DBOp The database operation (`send', `cache', `sendNcache',
+%%        `sendNhotcache', `ixfr').
+%% @param SOANSSize The size of SOA+NS records (for first packet offset).
+%% @param IXFRNewR Whether the IXFR "new records" SOA has been emitted.
+%% @param Proto The `#proto{}' record.
+%% @returns `{ok, NRules, NIOCs}' with the total rule and IOC counts.
+
+% Empty zone
 send_packets(Socket,[], [], 0, _ACount, _Zip, PktH, Questions, SOAREC,NSRec,Zone,_MP,_PktHLen,_T_ZIP_L,TSIG,PktN,DBOp,_SOANSSize,_IXFRNewR,Proto) -> %NSRec = Client SOA for IXFR
 %%%TODO save # of rules set to 0 for AXRF
    if (DBOp == send) or (DBOp == sendNcache) or (DBOp == sendNhotcache) or (DBOp == ixfr) ->
@@ -1018,6 +1365,15 @@ send_packets(Socket,[{IOC,IOCExp,IoCType}|Tail], Pkt, ACount, PSize, Zip, PktH, 
   PSize1 = byte_size(Pkt1)+SOANSSize,
   send_packets(Socket,Tail, Pkt1 , ACount+Cnt1, PSize1, Zip, PktH, Questions, SOAREC,NSRec,Zone#rpz{rule_count=Zone#rpz.rule_count+Cnt, ioc_count=Zone#rpz.ioc_count+1},MP,PktHLen,T_ZIP_L,TSIG,PktN,DBOp,SOANSSize,IXFRNewR1,Proto).
 
+%% @doc Generates wildcard RPZ rules when wildcards are enabled.
+%% When `<<"true">>', creates a `*.' prefixed rule using label compression
+%% if the packet offset allows it (below 16#3FFF), otherwise uses uncompressed labels.
+%% When `<<"false">>', returns no additional rules (count=1 for the base rule only).
+%% @param WCards `<<"true">>' or `<<"false">>'.
+%% @param Rules The base rule binaries.
+%% @param WRules The wildcard-compatible rule binaries (without domain prefix).
+%% @param PSize The current packet size for compression offset calculation.
+%% @returns `{ok, [WildcardRuleBinaries], Count}'.
 gen_wildcard(WCards, [Rules|RESTR], [WRules|RESTWR], PSize) ->
   {ok,Rul1,Cnt1}=gen_wildcard(WCards, Rules, WRules, PSize),
   {ok,Rul2,Cnt2}=gen_wildcard(WCards, RESTR, RESTWR, PSize),
@@ -1037,6 +1393,12 @@ gen_wildcard(<<"true">>, Rules, _WRules, PSize) when PSize >= 16#3FFF ->
 gen_wildcard(<<"false">>, _Rules, _WRules, _PSize) ->
   {ok,[],1}.
 
+%% @doc Removes whitelisted indicators from the IOC list and deduplicates.
+%% When the whitelist is empty, only deduplicates using ordsets.
+%% When non-empty, builds a gb_set from whitelist entries and filters them out.
+%% @param IOC The list of `{IOCBinary, Expiry, Type}' tuples.
+%% @param WL The whitelist as a list of `{IOCBinary, Expiry, Type}' tuples, or `[]'.
+%% @returns A deduplicated, whitelist-filtered, sorted list of IOC tuples.
 remove_WL(IOC,WL) when WL == [] ->
 %the function removes whitelisted indicators from the list of IOC
 %remove duplicates
@@ -1054,6 +1416,13 @@ remove_WL(IOC,WL) ->
   %%%TODO add ioc_type {E,Exp,IOC_Type}
   [X || {E,_Exp,_IoCType} = X <- ordsets:to_list(ordsets:from_list(IOC)), not gb_sets:is_element(E, WLSet)]. % TODO duplicates gb_sets vs ordsets
 
+%% @doc Checks if a source is currently being updated by another process.
+%% If no other process holds the source (pid is `[]'), claims it by updating
+%% the ETS config table with the current process PID. If another process is
+%% active, waits and retries. If the other process is dead, reclaims the source.
+%% @param Source The `#source{}' record.
+%% @param SRC The source name string.
+%% @param Pid The PID of the process currently updating the source, or `[]'.
 check_source_updating(Source, SRC,[]) ->
   ets:update_element(cfg_table, [source,SRC], [{2, Source#source{pid=self()}}]);
 
@@ -1076,9 +1445,26 @@ check_source_updating(_Source, SRC, Pid, false) -> % if the proces is not alive 
       check_source_updating(Source, SRC, Source#source.pid)
   end.
 
+%% @doc Fetches IOCs from all sources for a zone and removes whitelisted entries.
+%% This is the top-level entry point that collects indicators from all configured
+%% sources (via `mrpz_from_ioc/4') and subtracts whitelisted indicators.
+%% @param Zone The `#rpz{}' record containing source and whitelist references.
+%% @param UType The update type: `axfr' for full zone, `ixfr' for incremental.
+%% @returns A deduplicated, whitelist-filtered list of `{IOC, Expiry, Type}' tuples.
 mrpz_from_ioc(Zone,UType) -> %Zone - RPZ zone
   remove_WL(mrpz_from_ioc(Zone#rpz.sources,Zone,UType,[]),mrpz_from_ioc(Zone#rpz.whitelist,Zone,axfr,[])).% -- WL.
 
+%% @doc Recursively fetches IOCs from a list of source names.
+%% For each source, checks the hot cache first; if cached and not expired,
+%% uses the cached data. Otherwise downloads fresh data via `ioc2rpz_conn:get_ioc/2',
+%% caches it, and accumulates the results. Handles both AXFR (full) and IXFR
+%% (incremental) source URLs. Updates the source's `ioc_count' in `cfg_table'.
+%%
+%% @param Sources A list of source name strings.
+%% @param RPZ The `#rpz{}' record for the zone being updated.
+%% @param UType The update type: `axfr' or `ixfr'.
+%% @param IOC The accumulated list of IOC tuples from previous sources.
+%% @returns A list of `{IOC, Expiry, Type}' tuples from all sources.
 mrpz_from_ioc([SRC|REST], RPZ,UType, IOC) -> %List of the sources, RPZ zone, UType - AXFR/IXFR update type, IOC - list of accumulated IOCs
   CTime=RPZ#rpz.serial, %CTime=ioc2rpz_fun:curr_serial(),
   [[Source]]=ets:match(cfg_table,{[source,SRC],'$2'}),
@@ -1124,7 +1510,38 @@ mrpz_from_ioc([SRC|REST], RPZ,UType, IOC) -> %List of the sources, RPZ zone, UTy
 mrpz_from_ioc([],_RPZ,_UType,IOC) ->
   IOC.
 
-%Данная ветка спользуется только для sample zone
+%% @doc Generates DNS RPZ rule resource records for a given domain and action.
+%% This is the core RPZ rule generator that converts an IOC domain name and
+%% RPZ action into DNS wire-format resource records. Supports label compression
+%% via the T_ZIP_L ETS table.
+%%
+%% When Wildcard is `<<"true">>', generates both the base rule and a wildcard
+%% (`*.' prefix) rule. When `<<"false">>', generates a single rule.
+%%
+%% Supported actions:
+%% - `<<"nxdomain">>' - CNAME to root (`.') causing NXDOMAIN
+%% - `<<"nodata">>' - CNAME to `*' causing empty answer
+%% - `<<"passthru">>' - CNAME to `rpz-passthru' (allow through)
+%% - `<<"drop">>' - CNAME to `rpz-drop' (silently drop)
+%% - `<<"tcp-only">>' - CNAME to `rpz-tcp-only' (force TCP retry)
+%% - `{<<"redirect_domain">>, Domain}' - CNAME to specified domain
+%% - `{<<"redirect_ip">>, IP}' - A/AAAA record with specified IP
+%% - `{<<"local_txt">>, Text}' - TXT record with specified text
+%% - `<<"ip">>', `<<"nsdname">>', `<<"nsip">>' - Special RPZ trigger types
+%%   that append the appropriate RPZ trigger prefix to the domain
+%% - List of actions - generates multiple rules per IOC
+%%
+%% @param Domain The fully qualified domain name binary for the RPZ rule.
+%% @param RPZ The `#rpz{}' record for the zone.
+%% @param TTL The TTL value for the generated records.
+%% @param Wildcard `<<"true">>' or `<<"false">>' for wildcard generation.
+%% @param Action The RPZ action (see above).
+%% @param LocData Additional location data (action-specific, or `[]').
+%% @param PktHLen The current packet offset for label compression.
+%% @param T_ZIP_L The label compression ETS table ID.
+%% @returns `{ok, Count, [RuleBinaries], [WildcardRuleBinaries]}'.
+
+%% This branch is used only for the sample zone (wildcard=true)
 gen_rpzrule(Domain,RPZ,TTL,<<"true">>,Action, LocData,PktHLen,T_ZIP_L) -> %wildcard = true
   {ok,Cnt1,Pkt1,_WPkt1} = gen_rpzrule(Domain,RPZ,TTL,<<"false">>,Action, LocData,PktHLen,T_ZIP_L),
   {ok,Cnt2,Pkt2,_WPkt2} = gen_rpzrule(<<"*.",Domain/binary>>,RPZ,TTL,<<"false">>,Action, LocData,PktHLen+byte_size(list_to_binary(Pkt1)),T_ZIP_L),
@@ -1240,6 +1657,12 @@ gen_rpzrule(Domain,_,_,_,Action,_,_,_) ->
 %reverse_IP(OrigIP) when OrigIP == <<"::1">>;OrigIP == <<"::1/128">>;OrigIP == <<"::01">>;OrigIP == <<"::01/128">> ->
 %  <<"128.1.zz">>;
 
+%% @doc Reverses an IP address into RPZ wire format for IP-based triggers.
+%% Converts IPv4 addresses like "10.20.30.40" to "32.40.30.20.10" (with /32 prefix).
+%% Handles CIDR notation (e.g., "10.0.0.0/8" becomes "8.0.0.0.10").
+%% Delegates IPv6 addresses to `reverse_IP6/4'.
+%% @param OrigIP The IP address binary string, optionally with CIDR mask.
+%% @returns The reversed IP binary string in RPZ format.
 reverse_IP(OrigIP) ->
   [IP|Mask] = ioc2rpz_fun:split_tail(OrigIP, <<"/">>),
   case {ioc2rpz_fun:split_tail(IP, <<".">>),Mask} of
@@ -1273,6 +1696,11 @@ reverse_IP6(RIP,[<<>>|TAIL],ZZ) when ZZ == yes ->
 reverse_IP6(RIP,[DIP|TAIL],ZZ) ->
   reverse_IP6([DIP,<<".">>,RIP],TAIL,ZZ).
 
+%% @doc Converts a domain name string to DNS wire format binary.
+%% Splits the domain by "." and encodes each label with a length prefix byte.
+%% Labels longer than 63 bytes are rejected per DNS specification.
+%% @param Str The domain name as a binary string.
+%% @returns `{ok, Binary}' on success, `{error, []}' if any label exceeds 63 bytes.
 domstr_to_bin(Str) ->
   domstr_to_bin(ioc2rpz_fun:split_tail(Str, <<".">>),1,<<>>).
 domstr_to_bin(Str,Zero) ->
@@ -1289,6 +1717,15 @@ domstr_to_bin([],_,Bin) ->
   {ok,list_to_binary([Bin])}.
 
 
+%% @doc Converts a domain name string to DNS wire format with label compression.
+%% Uses the T_ZIP_L ETS table to track previously seen label suffixes and
+%% replace them with 2-byte compression pointers (offset at or above 0xC000).
+%% Falls back to `domstr_to_bin/2' for very short domains.
+%% @param Str The domain name binary string.
+%% @param Pos The current byte offset in the DNS packet for compression.
+%% @param T_ZIP_L The label compression ETS table ID.
+%% @returns `{ok, Binary}' or `{zip, Binary}' (with compression pointers),
+%%          or `{error, []}' on invalid input.
 domstr_to_bin_zip(Str,Pos,T_ZIP_L) when byte_size(Str) > 2->
 %  ioc2rpz_fun:logMessage("Domain ~p ~n",[Str]), %TODO debug
   domstr_to_bin_zip(clean_labels(Str),1,Pos,T_ZIP_L);
@@ -1329,6 +1766,12 @@ domstr_to_bin_zip([],0,Bin,_Pos,_T_ZIP_L) ->
 domstr_to_bin_zip([],_Zero,Bin,_Pos,_T_ZIP_L) ->
   {ok,list_to_binary([Bin])}.
 
+%% @doc Validates and cleans domain name labels.
+%% Splits the domain by "." and checks each label contains only valid DNS
+%% characters (alphanumeric, hyphen, underscore). Removes empty labels caused
+%% by consecutive dots. Returns `{ok, Labels}' or `{error, Str}'.
+%% @param Str The domain name binary string.
+%% @returns `{ok, [LabelBinaries]}' or `{error, OriginalStr}'.
 clean_labels(Str) ->
   Labels = ioc2rpz_fun:split_tail(Str, <<".">>),
 	%?logDebugMSG("Labels ~p ~n",[Labels]),
@@ -1357,6 +1800,12 @@ clean_labels(GoodL, []) when GoodL ==[] ->
 clean_labels(GoodL, []) when GoodL /=[] ->
 	{ok, GoodL}.
 
+%% @doc Converts a DNS wire-format binary domain name to a human-readable string.
+%% Reads length-prefixed labels and joins them with dots. Stops at a zero-length
+%% label, a compression pointer (length 192 or above), or when the remaining binary
+%% is shorter than the declared label length.
+%% @param Dom The DNS wire-format binary.
+%% @returns A string representation of the domain name.
 dombin_to_str(Dom) ->
   dombin_to_str(<<"">>,Dom).
 dombin_to_str(Dom,<<>>) ->
@@ -1370,10 +1819,19 @@ dombin_to_str(Dom,<<Len:8,Rest/binary>>) when (Len =< 63) and (byte_size(Rest)>=
   <<Dom1:Len/bytes,Rest1/binary>> = Rest,
   dombin_to_str(Dom++"."++binary_to_list(Dom1),Rest1).
 
+%% @doc Converts a binary to a hexadecimal string representation.
+%% Each byte is formatted as a 2-digit uppercase hex value separated by spaces.
+%% @param Bin The binary to convert.
+%% @returns A flat string of hex values.
 bin_to_hexstr(Bin) ->
   lists:flatten([io_lib:format("~2.16.0B ", [X]) ||
     X <- binary_to_list(Bin)]).
 
+%% @doc Converts a hexadecimal string to a binary.
+%% Parses pairs of hex characters into bytes. Handles odd-length strings by
+%% padding the last character with "0".
+%% @param S The hex string to convert.
+%% @returns A binary.
 hexstr_to_bin(S) ->
   hexstr_to_bin(S, []).
 hexstr_to_bin([], Acc) ->
@@ -1385,6 +1843,11 @@ hexstr_to_bin([X|T], Acc) ->
   {ok, [V], []} = io_lib:fread("~16u", lists:flatten([X,"0"])),
   hexstr_to_bin(T, [V | Acc]).
 
+%% @doc Converts an internal Erlang IP address tuple to a human-readable string.
+%% Handles IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) by extracting the
+%% IPv4 portion. Delegates to `inet_parse:ntoa/1' for formatting.
+%% @param IP An IP address tuple ({A,B,C,D} for IPv4 or 8-tuple for IPv6).
+%% @returns A string representation of the IP address.
 %%% Convert internal IP representation to a string
 ip_to_str({0,0,0,0,0,65535,IP1,IP2}) ->
   <<IP1B1:8, IP1B2:8>> = <<IP1:16>>,
@@ -1397,6 +1860,12 @@ ip_to_str(IP) ->
   inet_parse:ntoa(IP).
 
 
+%% @doc Initializes the label compression ETS table for a zone.
+%% Creates a private ETS set table and pre-populates it with the zone name
+%% labels at the standard zone name offset (`?ZNameZipN'), enabling compression
+%% of the zone name suffix in all subsequent RPZ rule records.
+%% @param Zone The `#rpz{}' record containing the zone_str field.
+%% @returns The ETS table ID for the label compression table.
 init_T_ZIP_L(Zone) ->
 	T_ZIP_L=ets:new(label_zip_table, [{read_concurrency, true}, {write_concurrency, true}, set, private]),
 	Labels = ioc2rpz_fun:split_tail(list_to_binary(Zone#rpz.zone_str), <<".">>),
@@ -1404,6 +1873,14 @@ init_T_ZIP_L(Zone) ->
 	T_ZIP_L.
 
 
+%% @doc Extracts a DNS label (domain name) from a binary packet.
+%% Handles both regular labels (length-prefixed) and compressed labels
+%% (2-byte pointer with high bits 11). Recursively reads labels until
+%% a zero-length terminator or compression pointer is encountered.
+%% The AddZero parameter controls whether a zero byte is appended at the end.
+%% @param Packet The binary packet to extract from.
+%% @param AddZero `<<0>>' to append a zero terminator, or `<<>>' for none.
+%% @returns `{RemainingBinary, LabelBinary}'.
 %Extract zipped or regular label
 extract_label(Packet,AddZero) ->
  extract_label(Packet,<<>>,AddZero).

@@ -1,0 +1,14 @@
+# Sample IOC source — mixed FQDN and IP indicators (no expiration)
+# Combines domains (example.com) with documentation IPs (RFC 5737/3849).
+malware-c2.example.com
+192.0.2.20
+dropper.example.com
+198.51.100.33
+keylogger.example.com
+203.0.113.77
+2001:db8:a::1
+infostealer.example.com
+click-fraud.example.com
+2001:db8:b::cafe
+198.51.100.200
+backdoor.example.com

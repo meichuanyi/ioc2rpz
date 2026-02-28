@@ -1,0 +1,13 @@
+# Sample whitelist — trusted domains and IPs to exclude from RPZ zones
+# ioc2rpz performs exact-match only (no subnet or wildcard matching).
+# Uses example.com (RFC 2606) and documentation IPs (RFC 5737/3849).
+example.com
+www.example.com
+mail.example.com
+cdn.example.com
+api.example.com
+login.example.com
+192.0.2.1
+198.51.100.0
+203.0.113.1
+2001:db8::1

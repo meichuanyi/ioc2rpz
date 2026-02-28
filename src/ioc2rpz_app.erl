@@ -12,12 +12,29 @@
 %See the License for the specific language governing permissions and
 %limitations under the License.
 
-%ioc2rpz application
+%% @doc ioc2rpz OTP application callback module.
+%%
+%% Implements the `application' behaviour for the ioc2rpz DNS RPZ server.
+%% Reads environment configuration (IPv4/IPv6 addresses, config file path,
+%% database directory) and starts the top-level supervisor.
+%% @end
 -module(ioc2rpz_app).
 -behaviour(application).
 -export([start/2, stop/1]).
 -include_lib("ioc2rpz.hrl").
 
+%% @doc Start the ioc2rpz application.
+%%
+%% Reads the following application environment variables:
+%% <ul>
+%%   <li>`ipv4' - IPv4 listen address (default: `""')</li>
+%%   <li>`ipv6' - IPv6 listen address (default: `""')</li>
+%%   <li>`conf_file' - Path to the configuration file (default: `?DefConf')</li>
+%%   <li>`db_dir' - Database directory (default: `?DefDB')</li>
+%%   <li>`cd' - Working directory (default: current working directory)</li>
+%% </ul>
+%% Sets the working directory and delegates to {@link ioc2rpz_sup:start_ioc2rpz_sup/1}.
+%% @end
 start(_StartType, _Start_Args) ->
     IPv4=get_env(ioc2rpz, ipv4, ""),
     IPv6=get_env(ioc2rpz, ipv6, ""),
@@ -29,10 +46,15 @@ start(_StartType, _Start_Args) ->
     io:format("Env ip4: ~p ip6: ~p conf: ~p db: ~p cwd: ~p ~n",[IPv4,IPv6,Conf_File,DB,Dir]),
     ioc2rpz_sup:start_ioc2rpz_sup([IPv4,IPv6,Conf_File,DB]).
 
+%% @doc Stop the ioc2rpz application.
+%% @end
 stop(_State) ->
     ok.
 
-
+%% @doc Retrieve an application environment variable with a default.
+%%
+%% Returns `Default' when the variable is undefined or set to an empty list.
+%% @end
 get_env(App, Param, Default) ->
   case application:get_env(App, Param) of
     undefined   ->  Default;

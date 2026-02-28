@@ -21,14 +21,31 @@
          bin_to_lowcase/1,ip_in_list/2,intersection/2,bin_to_hexstr/1,conv_to_Mb/1,q_class/1,q_type/1,split/2,msg_CEF/1,base64url_decode/1,get_cipher_suites/1,
          str_to_ip/1,check_rate_limit/1]).
 
+%% @doc Logs a formatted message to the group leader with a timestamp prefix.
+%% Delegates to {@link logMessage/3} using `group_leader()' as the destination.
+%% @param Message An `io:format/2' format string.
+%% @param Vars A list of arguments for the format string.
+-spec logMessage(string(), list()) -> ok.
 logMessage(Message, Vars) ->
   logMessage(group_leader(), Message, Vars).
 
+%% @doc Logs a formatted message to the specified IO destination with a timestamp prefix.
+%% @param Dest The IO device to write to (e.g., `group_leader()').
+%% @param Message An `io:format/2' format string.
+%% @param Vars A list of arguments for the format string.
+-spec logMessage(pid() | atom(), string(), list()) -> ok.
 logMessage(Dest, Message, Vars) ->
  ?addTS(Dest),
  io:fwrite(Dest,Message,Vars).
 
 
+%% @doc Logs a CEF (Common Event Format) message to the group leader.
+%% The caller must supply the CEF fields from "Device Event Class ID" onward:
+%% `"Device Event Class ID|Name|Severity|[Extension]"'.
+%% The CEF header (Version, Vendor, Product, Device Version) is prepended automatically.
+%% @param Message A format string for the CEF payload (starting with `|').
+%% @param Vars A list of arguments for the format string.
+%% @see msg_CEF/1
 logMessageCEF(Message, Vars) -> % "Device Event Class ID|Name|Severity|[Extension]" must be passed
   logMessageCEF(group_leader(), Message, Vars).
 
@@ -39,6 +56,30 @@ logMessageCEF(Dest, Message, Vars) ->
 %CEF:Version|Device Vendor|Device Product|Device Version|Device Event Class ID|Name|Severity|[Extension]
 % Severity is a string or integer and reflects the importance of the event. The valid string values are Unknown, Low, Medium, High, and Very-High. The valid integer values are 0-3=Low, 4-6=Medium, 7- 8=High, and 9-10=Very-High.
 
+%% @doc Returns a CEF format string template for the given event class ID.
+%%
+%% Each clause maps a numeric event code to a CEF-formatted string containing
+%% pipe-delimited fields: `"|ClassID|Name|Severity|Extension\n"'.
+%% The returned string is suitable for use with `io:fwrite/2' or `io_lib:format/2'.
+%%
+%% Event code ranges:
+%% <ul>
+%%   <li>101–109: DNS protocol events (bad packet, refused, TSIG errors)</li>
+%%   <li>120–121: RPZ lookup events (not found, not ready)</li>
+%%   <li>130–131: RPZ transfer events (error, remote close).
+%%       <b>Note:</b> codes 130/131 have duplicate clauses — the second set
+%%       (REST API auth) is currently unreachable dead code (see bugfix task 29).</li>
+%%   <li>135–138: REST/MGMT events (denied, failed, unsupported, zone not found)</li>
+%%   <li>201–202: Success events (RPZ transfer, DNS query)</li>
+%%   <li>221–222: DNS Notify events</li>
+%%   <li>230, 301: Management request events</li>
+%%   <li>429: Rate limiting</li>
+%%   <li>501: DDoS detection (CVE-2004-0789)</li>
+%% </ul>
+%%
+%% @param Code An integer event class ID.
+%% @returns A CEF format string, or `"Not defined\n"' for unknown codes.
+-spec msg_CEF(integer()) -> string().
 msg_CEF(101)    -> "|000101|Bad DNS packet|3|src=~s spt=~p proto=~p~n";
 msg_CEF(102)    -> "|000102|Bad DNS request|3|src=~s spt=~p proto=~p qname=~p qtype=~p qclass=~p~n";
 msg_CEF(103)    -> "|000103|Refused|5|src=~s spt=~p proto=~p qname=~p qtype=~p qclass=~p tsigkey=~p msg=~p~n";
@@ -79,6 +120,9 @@ msg_CEF(501)    -> "|000501|Possible DDoS CVE-2004-0789|37|src=~s spt=~p proto=~
 
 msg_CEF(_)    -> "Not defined~n".
 
+%% @doc Converts a list of strings to a flattened list of binaries.
+%% @param Strs A list of string values.
+%% @returns A flattened list of binaries.
 strs_to_binary(Strs) ->
   strs_to_binary(Strs,[]).
 
@@ -89,15 +133,31 @@ strs_to_binary([],Result) ->
   lists:flatten(Result).
 
 
+%% @doc Returns the current UNIX timestamp in seconds.
+%% Used as the serial number for DNS zone SOA records.
+%% @returns An integer representing seconds since the UNIX epoch.
+-spec curr_serial() -> non_neg_integer().
 curr_serial() ->
   erlang:system_time(seconds).
 
+%% @doc Returns the current UNIX timestamp rounded down to the nearest minute.
+%% The minute-resolution serial is used to cache IXFR responses so that
+%% multiple requests within the same minute share the same serial.
+%% @returns An integer representing seconds since the UNIX epoch, truncated to 60s.
+-spec curr_serial_60() -> non_neg_integer().
 curr_serial_60() -> %Current serial has a minute resolution to cache IXFR
   CTime=erlang:system_time(seconds),
   CTime - CTime rem 60.
 
 
 
+%% @doc Constructs an IXFR URL by substituting timestamp placeholders.
+%% Replaces `"[:FTimestamp:]"' and `"[:ToTimestamp:]"' tokens in the URL
+%% template with the given `FromTime' and `ToTime' integer values.
+%% @param IUrl A tokenized URL (list of strings with possible placeholder tokens).
+%% @param FromTime The start timestamp (integer seconds).
+%% @param ToTime The end timestamp (integer seconds).
+%% @returns The assembled URL string with timestamps substituted.
 constr_ixfr_url(IUrl,FromTime,ToTime) ->
   constr_ixfr_url(IUrl,FromTime,ToTime,[]).
 
@@ -127,6 +187,11 @@ z_split(Bin,N, Pattern) ->
       z_split(Bin, N+1,Pattern)
   end.
 
+%% @doc Converts an IP address string to a 4-byte (IPv4) or 16-byte (IPv6) binary.
+%% Accepts a string like `"10.10.10.10"' or `"fc00::01"' and returns the
+%% packed binary representation suitable for DNS wire format.
+%% @param IP A string representation of an IPv4 or IPv6 address.
+%% @returns A binary: 4 bytes for IPv4, 16 bytes for IPv6.
 ip_to_bin(IP) when is_list(IP)->
   ip_to_bin(inet:parse_address(IP));
 
@@ -136,11 +201,26 @@ ip_to_bin({ok,{IP1,IP2,IP3,IP4}}) ->
 ip_to_bin({ok,{IP1,IP2,IP3,IP4,IP5,IP6,IP7,IP8}}) ->
   <<IP1:16,IP2:16,IP3:16,IP4:16,IP5:16,IP6:16,IP7:16,IP8:16>>.
 
+%% @doc Parses an IP address string into an `inet:ip_address()' tuple.
+%% @param IPStr A string representation of an IPv4 or IPv6 address.
+%% @returns An `inet:ip_address()' tuple (e.g., `{10,10,10,10}').
 str_to_ip(IPStr)->
   %TODO Error handling
   {ok,IP}= inet:parse_address(IPStr),
   IP.
 
+%% @doc Parses RPZ local action definitions into binary form.
+%% Converts action tuples from the configuration file into internal binary
+%% representations used for RPZ response generation.
+%%
+%% Supported actions:
+%% <ul>
+%%   <li>`"local_a"' / `"local_aaaa"' — IP address converted via {@link ip_to_bin/1}</li>
+%%   <li>`"local_cname"' — domain split on `"."' into label list</li>
+%%   <li>`"local_txt"' — text prefixed with its byte length</li>
+%% </ul>
+%% @param Actions A list of `{ActionType, Data}' tuples from configuration.
+%% @returns A list of `{BinaryAction, BinaryData}' tuples.
 read_local_actions(Actions) ->
  read_local_actions(Actions,[]).
 
@@ -159,6 +239,12 @@ read_local_actions([],Acc) ->
  Acc.
 
 
+%% @doc Splits a binary into chunks of the given byte size.
+%% The last chunk may be smaller than `Size' if the binary length is not
+%% evenly divisible. Returns an empty list for an empty binary.
+%% @param Bin The binary to split.
+%% @param Size The maximum chunk size in bytes (must be &gt; 0).
+%% @returns A list of binary chunks.
 split_bin_bytes(Bin, Size) when byte_size(Bin) >= Size, Size>0 ->
     {Chunk, Rest} = split_binary(Bin, Size),
     [Chunk|split_bin_bytes(Rest, Size)];
@@ -168,9 +254,18 @@ split_bin_bytes(Bin,_Size)  ->
     [Bin].
 
 
+%% @doc Splits a binary string on a pattern, returning segments in order.
+%% Wrapper around `binary:split/3' with the `global' option.
+%% @param String The binary to split.
+%% @param Pattern The delimiter pattern (binary or list of binaries).
+%% @returns A list of binary segments.
 split_tail(String, Pattern) ->
  binary:split(String,Pattern,[global]). %[<<"\r\n">>,<<"\n">>,<<"\r">>]
 
+%% @doc Splits a binary string on a pattern, returning segments in reverse order.
+%% @param String The binary to split.
+%% @param Pattern The delimiter pattern.
+%% @returns A reversed list of binary segments.
 rsplit_tail(String, Pattern) ->
  lists:reverse(split_tail(String, Pattern)).
 
@@ -193,6 +288,11 @@ rsplit_tail(String, Pattern) ->
 
 %%% bin_to_lowcase
 %%% 2025-01-10 Remove blow after validation of the optimization
+%% @doc Converts all uppercase ASCII characters (A–Z) in a binary to lowercase.
+%% Non-ASCII bytes and already-lowercase bytes are passed through unchanged.
+%% @param A A binary string.
+%% @returns A new binary with all ASCII uppercase letters lowercased.
+-spec bin_to_lowcase(binary()) -> binary().
 bin_to_lowcase(A) ->
  << << (b_to_lowcase(C)) >> || << C >> <= A >>.
 b_to_lowcase(A) when A>=65,A=<90 ->
@@ -201,11 +301,26 @@ b_to_lowcase(A) ->
  A.
 %%% End bin_to_lowcase
 
+%% @doc Checks whether an IP address is a member of the given access control list.
+%% Currently performs a simple `lists:member/2' lookup.
+%% @param IP The IP address tuple to check (e.g., `{10,0,0,1}').
+%% @param LST A list of allowed IP address tuples.
+%% @returns `true' if `IP' is in `LST', `false' otherwise.
+%% @todo Add CIDR prefix matching support.
+-spec ip_in_list(inet:ip_address(), [inet:ip_address()]) -> boolean().
 ip_in_list(IP,LST) -> %TODO check CIDR as well
  lists:member(IP,LST).
 
+%% @doc Returns the intersection of two lists.
+%% @param L1 First list.
+%% @param L2 Second list.
+%% @returns A list of elements present in both `L1' and `L2'.
 intersection(L1,L2) -> lists:filter(fun(X) -> lists:member(X,L1) end, L2).
 
+%% @doc Converts a 128-bit binary (e.g., an MD5 hash) to a lowercase hex string.
+%% @param Bin A 128-bit (16-byte) binary value.
+%% @returns A 32-character lowercase hexadecimal string.
+-spec bin_to_hexstr(<<_:128>>) -> string().
 bin_to_hexstr(<<Bin:128/big-unsigned-integer>>) ->
  lists:flatten(io_lib:format("~32.16.0b", [Bin])).
 
@@ -219,6 +334,11 @@ bin_to_hexstr(<<Bin:128/big-unsigned-integer>>) ->
 %  end).
 
 
+%% @doc Converts a byte size into a human-readable string with unit suffix.
+%% Values below 1024 are returned as `"N/bytes"'. Larger values are scaled
+%% to KB, MB, GB, TB, or PB with two decimal places.
+%% @param Size A non-negative integer byte count.
+%% @returns A binary like `<<"42/bytes">>' or `<<"1.50/KB">>'.
 conv_to_Mb(Size) when Size >= 1024 -> conv_to_Mb(Size, ["B","KB","MB","GB","TB","PB"]);
 
 conv_to_Mb(Size) ->
@@ -229,11 +349,21 @@ conv_to_Mb(S, [M|_]) ->
     list_to_binary(io_lib:format("~.2f/~s", [float(S), M])).
 
 
+%% @doc Returns the human-readable string for a DNS query class code.
+%% Maps well-known class constants (`?C_IN', `?C_CHAOS', `?C_ANY') to their
+%% string names. Unknown classes are returned as their integer string form.
+%% @param QClass An integer DNS class code.
+%% @returns A string such as `"IN"', `"CHAOS"', `"ANY"', or the numeric string.
 q_class(?C_IN)    -> "IN";
 q_class(?C_CHAOS) -> "CHAOS";
 q_class(?C_ANY)   -> "ANY";
 q_class(QClass)   -> integer_to_list(QClass).
 
+%% @doc Returns the human-readable string for a DNS query type code.
+%% Maps well-known type constants (`?T_A', `?T_AAAA', `?T_SOA', `?T_AXFR', etc.)
+%% to their string names. Unknown types are returned as their integer string form.
+%% @param QType An integer DNS type code.
+%% @returns A string such as `"A"', `"AAAA"', `"SOA"', or the numeric string.
 q_type(?T_A)      -> "A";
 q_type(?T_NS)     -> "NS";
 q_type(?T_CNAME)  -> "CNAME";
@@ -255,6 +385,11 @@ q_type(QType)     -> integer_to_list(QType).
 % p99:split([a,b,c],2). =>  [[a,b],[c]]
 % p99:split([a,b,c],1). =>  [[a],[b,c]]
 
+%% @doc Splits a list into two parts at the given index.
+%% Returns a list of two sublists: the first `Index' elements and the remainder.
+%% @param List The input list.
+%% @param Index The number of elements in the first part (must be &gt; 0).
+%% @returns `[FirstPart, SecondPart]' where `length(FirstPart) =:= Index'.
 split([],_)->
     [];
 split([H|T],Index) when Index>0,T==[] ->
@@ -267,6 +402,12 @@ split([H|T],Index)->
 
 
 
+%% @doc Decodes a base64url-encoded binary (RFC 4648 §5) to plain binary.
+%% Replaces URL-safe characters (`-' → `+', `_' → `/') and adds padding
+%% as needed before decoding. Returns `{ok, Binary}' on success or
+%% `{error, <<>>}' if decoding fails.
+%% @param Str A base64url-encoded binary.
+%% @returns `{ok, DecodedBinary}' | `{error, <<>>}'.
 base64url_decode(Str) ->
 	StrURL=binary:replace(binary:replace(Str,<<"-">>,<<"+">>,[global]),<<"_">>,<<"/">>,[global]),
 	Pad = case byte_size(StrURL) rem 4 of
@@ -283,6 +424,21 @@ base64url_decode(Str) ->
 	end.
 
 
+%% @doc Returns the SSL cipher suites for the given TLS version.
+%%
+%% Supported version strings:
+%% <ul>
+%%   <li>`'tlsv1.2-1.3'' — combined TLS 1.2 default + TLS 1.3 exclusive suites</li>
+%%   <li>`"tlsv1.2"', `"tlsv1.3"', `"dtlsv1.2"', `"tlsv1.1"' — default suites
+%%       for the specified version</li>
+%% </ul>
+%%
+%% <b>Note:</b> The second guarded clause is currently unreachable dead code
+%% (identical guard to the first). See bugfix task 30 for the planned fix
+%% to add a proper catch-all fallback.
+%%
+%% @param TLSVersion A TLS version atom or string.
+%% @returns A list of cipher suite maps as returned by `ssl:cipher_suites/2'.
 get_cipher_suites('tlsv1.2-1.3') ->
   TLS12=ssl:cipher_suites(default, 'tlsv1.2'),
   TLS13=ssl:cipher_suites(exclusive, 'tlsv1.3'),
@@ -295,6 +451,22 @@ get_cipher_suites(TLSVersion) when TLSVersion=="tlsv1.2";TLSVersion=="tlsv1.3";T
   logMessage("unsuported TLS version ~s ~n", [TLSVersion]),
   ssl:cipher_suites(default, 'tlsv1.2').
 
+%% @doc Checks whether a request identified by `Id' exceeds the rate limit.
+%%
+%% Uses the `?RATE_LIMIT_TABLE' ETS table to track request timestamps and
+%% counts per identifier. Within a sliding window of `?RATE_LIMIT_WINDOW'
+%% milliseconds, at most `?MAX_REQUESTS_PER_WINDOW' requests are allowed.
+%%
+%% If the window has expired, the counter is reset. If this is the first
+%% request for the given `Id', a new entry is created.
+%%
+%% <b>Note:</b> Expired entries are never deleted by this function, which can
+%% cause unbounded ETS table growth. See bugfix task 21 for the planned
+%% periodic cleanup mechanism.
+%%
+%% @param Id The rate limit key (typically a client IP or `{IP, QName, QType}' tuple).
+%% @returns `true' if the rate limit is exceeded, `false' otherwise.
+-spec check_rate_limit(term()) -> boolean().
 %%%Rate limiting function
 check_rate_limit(Id) ->
   CurrentTime = erlang:system_time(millisecond),

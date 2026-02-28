@@ -12,7 +12,18 @@
 %See the License for the specific language governing permissions and
 %limitations under the License.
 
-%IOC2RPZ Supervisor
+%% @doc IOC2RPZ top-level supervisor.
+%%
+%% Manages the OTP supervision tree for the ioc2rpz DNS RPZ server.
+%% Responsible for:
+%% <ul>
+%%   <li>Initialising the ETS configuration tables and database</li>
+%%   <li>Parsing the configuration file ({@link read_config3/1})</li>
+%%   <li>Starting child supervisors for TCP, TLS (DoT), UDP, REST, and DoH listeners</li>
+%%   <li>Scheduling periodic zone updates and hot-source reloads</li>
+%%   <li>Providing configuration reload without full restart ({@link reload_config3/1})</li>
+%% </ul>
+%% @end
 -module(ioc2rpz_sup).
 -behaviour(supervisor).
 -include_lib("kernel/include/file.hrl").
@@ -23,9 +34,19 @@
 
 %-compile([export_all]).
 
+%% @doc Start the top-level supervisor as a locally registered process.
+%%
+%% @param IP      IPv4 address string for listeners.
+%% @param IPv6    IPv6 address string for listeners.
+%% @param Filename  Path to the ioc2rpz configuration file.
+%% @param DBDir   Directory used for persistent zone database storage.
+%% @returns `{ok, Pid}' on success.
 start_ioc2rpz_sup([IP,IPv6,Filename,DBDir]) ->
   supervisor:start_link({local, ?MODULE}, ?MODULE, [IP,IPv6,Filename,DBDir]).
 
+%% @doc Gracefully stop the supervisor.
+%%
+%% Persists all cached zone data to disk before terminating.
 stop_ioc2rpz_sup() ->
   ioc2rpz_fun:logMessage("ioc2rpz recieved stop message ~n", []),
   ioc2rpz_fun:logMessage("saving DB ~n", []),
@@ -33,6 +54,35 @@ stop_ioc2rpz_sup() ->
   ioc2rpz_fun:logMessage("ioc2rpz is terminating ~n", []).
 %  gen_server:stop(?MODULE).
 
+%% @doc Supervisor `init/1' callback.
+%%
+%% Performs full server bootstrap:
+%% <ol>
+%%   <li>Starts the database supervisor and initialises ETS/mnesia storage</li>
+%%   <li>Creates the `cfg_table' and `rate_limits' ETS tables</li>
+%%   <li>Parses the configuration file via {@link read_config3/1}</li>
+%%   <li>Loads hot-sources and triggers initial zone updates</li>
+%%   <li>Sets up periodic timers for zone refresh and hot-source reload</li>
+%%   <li>Builds the child supervisor specs for TCP, UDP, TLS (DoT), and REST/DoH</li>
+%% </ol>
+%%
+%% Child supervisor setup:
+%% <ul>
+%%   <li>`ioc2rpz_tcp_sup_v6' — DNS over TCP (port 53)</li>
+%%   <li>`ioc2rpz_udp_sup_v6' — DNS over UDP (port 53)</li>
+%%   <li>`ioc2rpz_tls_sup_v6' — DNS over TLS / DoT (port 853), only when a certificate is configured</li>
+%%   <li>`ioc2rpz_rest_tls_sup_v6' — REST management API over HTTPS, only when a certificate is configured</li>
+%% </ul>
+%%
+%% All child supervisors use `one_for_one' strategy. Each child delegates to
+%% {@link ioc2rpz_proc_sup} which runs a `simple_one_for_one' pool of
+%% accept-loop workers.
+%%
+%% @param IPStr   IPv4 address string.
+%% @param IPStr6  IPv6 address string.
+%% @param Filename  Configuration file path.
+%% @param DBDir   Database directory path.
+%% @returns `{ok, {SupFlags, ChildSpecs}}'.
 init([IPStr,IPStr6, Filename, DBDir]) ->
   Pid=self(),
   ioc2rpz_fun:logMessage("ioc2rpz version: ~p, IP: ~s ~s, PID: ~p, Config: ~p ~n", [?ioc2rpz_ver,IPStr,IPStr6,Pid,Filename]),
@@ -159,6 +209,14 @@ init([IPStr,IPStr6, Filename, DBDir]) ->
 %  update_all_zones(false),
 %  ok.
 
+%% @doc Load or refresh hot-sources (sources marked `keep_in_cache').
+%%
+%% When called with `true', loads all hot-sources unconditionally (used at
+%% startup). When called with any other value, only reloads sources whose
+%% hot-cache has expired based on `hotcache_time'.
+%%
+%% @param LoadAll  `true' to force-load all hot-sources; any other value
+%%                 for conditional refresh.
 load_hotsources(true)->
   SW=[X#source.name || [X] <- ets:match(cfg_table, {[source,'_'],'$2'}), X#source.keep_in_cache == true],
   ioc2rpz_fun:logMessage("loading hot sources ~p ~n", [SW]),
@@ -177,6 +235,21 @@ load_hotsources(_LoadAllSources)->
 %%%
 %%% Read configuration file
 %%%
+%% @doc Trigger a configuration reload from the current config file.
+%%
+%% Reads the config file path from `cfg_table', saves zone info for cached
+%% zones, then delegates to {@link read_config3/2} with the given `Action'.
+%%
+%% Supported actions:
+%% <ul>
+%%   <li>`reload' — full reload: updates keys, sources, whitelists, and RPZ
+%%       zones; forces AXFR on changed zones</li>
+%%   <li>`updTkeys' — lightweight reload: only updates TSIG keys and key
+%%       groups without refreshing zones</li>
+%% </ul>
+%%
+%% @param Action  `reload' | `updTkeys'.
+%% @returns `ok'.
 reload_config3(Action)->
   [[Filename]] = ets:match(cfg_table,{cfg_file,'$1'}),
   ioc2rpz_fun:logMessage("ioc2rpz reloading configuration from ~p action ~p~n", [Filename, Action]),
@@ -185,6 +258,14 @@ reload_config3(Action)->
   read_config3(Filename,Action),
   ok.
 
+%% @doc Parse the configuration file at startup.
+%%
+%% Opens the file with `file:consult/1' and delegates to the 8-arity
+%% accumulator {@link read_config3/8} with `startup' mode. On error,
+%% logs the reason and calls `exit(config_error)'.
+%%
+%% @param Filename  Path to the Erlang-term configuration file.
+%% @returns `{ok, RPZ, Keys, Srv}' on success; does not return on error.
 read_config3(Filename)  ->
   case file:consult(Filename) of
     {ok,CFG} -> read_config3(CFG,startup,#srv{},[],[],[],[],[]);
@@ -192,6 +273,14 @@ read_config3(Filename)  ->
     {error, Reason} -> ioc2rpz_fun:logMessage("Error in configuration file ~p. ~p ~p ~n", [Filename,Reason, file:format_error(Reason)]), exit(config_error)
   end.
 
+%% @doc Parse the configuration file for a reload or include action.
+%%
+%% Same as {@link read_config3/1} but accepts an `Action' parameter
+%% (`reload', `updTkeys', or `include') to control how parsed terms
+%% are applied to the running system.
+%%
+%% @param Filename  Path to the configuration file.
+%% @param Action    `reload' | `updTkeys' | `include'.
 read_config3(Filename,Action)  ->
   case file:consult(Filename) of
     {ok,CFG} -> read_config3(CFG,Action,#srv{},[],[],[],[],[]);
@@ -200,6 +289,45 @@ read_config3(Filename,Action)  ->
   end.
 
 
+%% @doc Recursive configuration parser (8-arity accumulator).
+%%
+%% Processes a list of Erlang configuration terms one at a time,
+%% accumulating server settings, keys, key groups, whitelists, sources,
+%% and RPZ zone definitions. Each clause handles a specific config term:
+%%
+%% <ul>
+%%   <li>`{include, Filename}' — recursively parse another config file and
+%%       merge its results</li>
+%%   <li>`{srv, {...}}' — server identity: name, email, management keys, ACL</li>
+%%   <li>`{cert, {...}}' — TLS certificate, private key, and CA cert paths</li>
+%%   <li>`{key, {...}}' — TSIG key definition (name, algorithm, base64 secret,
+%%       optional key-group membership)</li>
+%%   <li>`{key_group, {...}}' — named group of TSIG keys</li>
+%%   <li>`{whitelist, {...}}' — whitelist source (various arities for optional
+%%       fields: userid, max_count, cache times, ioc_type, keep_in_cache)</li>
+%%   <li>`{source, {...}}' — IOC source with AXFR/IXFR URLs (same optional
+%%       field variants as whitelist)</li>
+%%   <li>`{rpz, {...}}' — RPZ zone definition with SOA timers, cache settings,
+%%       action, keys, sources, notify list, and whitelist references</li>
+%% </ul>
+%%
+%% Terminal clauses (empty list) vary by `RType':
+%% <ul>
+%%   <li>`startup' — inserts all parsed config into `cfg_table' ETS</li>
+%%   <li>`reload' — diffs against existing config, adds/removes/updates
+%%       keys, sources, whitelists, and RPZ zones; forces AXFR on changed zones</li>
+%%   <li>`updTkeys' — updates only TSIG keys and key groups</li>
+%%   <li>`include' — returns accumulated values to the parent parse call</li>
+%% </ul>
+%%
+%% @param CFGTerms    Remaining config terms to process.
+%% @param RType       Parse mode atom: `startup' | `reload' | `updTkeys' | `include'.
+%% @param Srv         Accumulated `#srv{}' record.
+%% @param Keys        Accumulated list of `#key{}' records.
+%% @param Key_Groups  Accumulated list of `#key_group{}' records.
+%% @param WhiteLists  Accumulated list of whitelist `#source{}' records.
+%% @param Sources     Accumulated list of IOC `#source{}' records.
+%% @param RPZ         Accumulated list of `#rpz{}' records.
 read_config3([{include,Filename}|REST],RType,Srv,Keys,Key_Groups,WhiteLists,Sources,RPZ) ->
   ioc2rpz_fun:logMessage("ioc2rpz including configuration from ~p~n", [Filename]),
 	case read_config3(Filename,include) of
@@ -281,6 +409,7 @@ read_config3([{rpz,{Zone, Refresh, Retry, Expiration, Neg_ttl, Cache, Wildcards,
   end,
   read_config3(REST,RType,Srv,Keys,Key_Groups,WhiteLists,SourcesC,[#rpz{zone=ZoneB, zone_str=Zone, soa_timers=SOATimers, cache=list_to_binary(Cache), wildcards=list_to_binary(Wildcards), action=ZAction, akeys=AKeysB, ioc_type=list_to_binary(IOCType), axfr_time=AXFR_Time, ixfr_time=IXFR_Time, sources=Sources, notifylist=NotifyListIP, whitelist=Whitelist, serial=Serial, status=Status, update_time=Update_time, ixfr_update_time=IXFR_Update_time, ixfr_nz_update_time=NZ_Update_Time, serial_ixfr=Serial_IXFR, key_groups=KeyGroups, ioc_count=IOC_count, rule_count=Rules_count}|RPZ]);
 
+%% Terminal clause — startup: validate and insert all config into ETS.
 read_config3([],startup,Srv,Keys,_Key_Groups,WhiteLists,Sources,RPZ)  ->
 	Keys_V = [ validateCFGKeys(Y) || Y <- Keys ],
   [ ets:insert_new(cfg_table, {[key,X#key.name_bin],X#key.name,X#key.alg,X#key.key}) || X <- Keys_V ],
@@ -300,6 +429,7 @@ read_config3([],startup,Srv,Keys,_Key_Groups,WhiteLists,Sources,RPZ)  ->
   [ ets:insert_new(cfg_table, {[rpz,X#rpz.zone],X#rpz.zone,X}) || X <- [ validateCFGRPZ(Y,Sources_V,WhiteLists_V) || Y <- RPZ ] ],
   {ok,RPZ,Keys,Srv};
 
+%% Terminal clause — updTkeys: update TSIG keys and key groups only.
 % Update TSIG Keys w/o refreshing zones.
 read_config3([],updTkeys,Srv,Keys,_Key_Groups,_WhiteLists,_Sources,RPZ)  -> %Simplify key management with key_groups
 % update TKEYs
@@ -319,6 +449,9 @@ read_config3([],updTkeys,Srv,Keys,_Key_Groups,_WhiteLists,_Sources,RPZ)  -> %Sim
   [ ets:update_element(cfg_table, [rpz,X#rpz.zone], [{3, X#rpz{akeys=(lists:keyfind(X#rpz.zone,3,RPZ))#rpz.akeys}}]) || X <- RPZ_C ],
   ok;
 
+%% Terminal clause — reload: diff existing config against new, apply changes.
+%% Computes added/removed/updated sets for sources, whitelists, and RPZ zones.
+%% Forces AXFR on updated zones and cleans up removed entries.
 read_config3([],reload,Srv,Keys,_Key_Groups,WhiteLists,Sources,RPZ)  ->
   RPZ_C=[ X || [X] <- ets:match(cfg_table, {[rpz,'_'],'_','$3'})],
   [ ets:update_element(cfg_table, [rpz,X#rpz.zone], [{3, X#rpz{serial_new=-1, status=updating, update_time=-1}}]) || X <- RPZ_C ],
@@ -402,37 +535,90 @@ read_config3([],reload,Srv,Keys,_Key_Groups,WhiteLists,Sources,RPZ)  ->
   %update_all_zones(false),
   ok;
 
+%% Terminal clause — include: return accumulated values to caller.
 read_config3([],include,Srv,Keys,Key_Groups,WhiteLists,Sources,RPZ)  ->
 	{ok,Srv,Keys,Key_Groups,WhiteLists,Sources,RPZ};
 
+%% Catch-all clause: log unknown config terms and continue parsing.
 read_config3([UTerm|REST],RType,Srv,Keys,Key_Groups,WhiteLists,Sources,RPZ) ->
   ioc2rpz_fun:logMessage("Unknown configuration term ~p~n", [UTerm]),
   read_config3(REST,RType,Srv,Keys,Key_Groups,WhiteLists,Sources,RPZ).
 
 
+%% @doc Compare two RPZ records for equality on configuration-relevant fields.
+%%
+%% Returns `true' if zone, SOA timers, cache, wildcards, action, ioc_type,
+%% sources, and whitelist are all identical; `false' otherwise.
+%% Used during reload to detect which zones need a forced AXFR.
 checkRPZEq(R1,R2) when R1#rpz.zone == R2#rpz.zone,R1#rpz.soa_timers == R2#rpz.soa_timers,R1#rpz.cache == R2#rpz.cache,R1#rpz.wildcards == R2#rpz.wildcards,R1#rpz.action == R2#rpz.action,R1#rpz.ioc_type == R2#rpz.ioc_type,R1#rpz.sources == R2#rpz.sources,R1#rpz.whitelist == R2#rpz.whitelist ->
   true;
 
 checkRPZEq(_R1,_R2) ->
   false.
 
+%% @doc Safe accessor for source records during reload diffing.
+%%
+%% Returns the record unchanged if it has a defined name; otherwise returns
+%% an empty `#source{}' to avoid badmatch on `lists:keyfind' returning `false'.
 checkSrcRec(Rec) when Rec#source.name /= undefined ->
 	Rec;
 checkSrcRec(_Rec) ->
 	#source{}.
 
+%% @doc Validate a TSIG key record.
+%%
+%% Placeholder — currently returns the key unchanged. Future implementations
+%% should verify key data format, algorithm support, and base64 encoding.
+%%
+%% @param Keys  A `#key{}' record.
+%% @returns The validated (currently unchanged) `#key{}' record.
 validateCFGKeys(Keys) -> %Check if key is good
   Keys.
 
+%% @doc Validate the server configuration record.
+%%
+%% Placeholder — currently returns the server record unchanged. Future
+%% implementations should verify management key references, ACL format,
+%% email syntax, and certificate file existence/readability.
+%%
+%% @param Srv  A `#srv{}' record.
+%% @returns The validated (currently unchanged) `#srv{}' record.
 validateCFGSrv(Srv) -> %Check: MGMT Keys, ACL, email and cert
   Srv.
 
+%% @doc Validate a whitelist source record.
+%%
+%% Placeholder — currently returns the whitelist unchanged. Future
+%% implementations should verify regex compilation and AXFR URL
+%% availability/syntax.
+%%
+%% @param WL  A whitelist `#source{}' record.
+%% @returns The validated (currently unchanged) `#source{}' record.
 validateCFGWL(WL) -> %Check: RegEx and AXFR URL availability. If URL is not available - log it and accept
   WL.
 
+%% @doc Validate an IOC source record.
+%%
+%% Placeholder — currently returns the source unchanged. Future
+%% implementations should verify regex compilation and URL
+%% availability/syntax for both AXFR and IXFR URLs.
+%%
+%% @param Src  A `#source{}' record.
+%% @returns The validated (currently unchanged) `#source{}' record.
 validateCFGSrc(Src) -> %Check: RegEx and URLs availability. If URL is not available - log it and accept
   Src.
 
+%% @doc Validate an RPZ zone record against available sources and whitelists.
+%%
+%% Checks that all source names referenced by the RPZ exist in the validated
+%% sources list. If any source is missing, logs an error and returns an empty
+%% list (the zone is not loaded). Whitelist validation is checked but currently
+%% does not block loading.
+%%
+%% @param RPZ  An `#rpz{}' record.
+%% @param S    List of validated `#source{}' records (IOC sources).
+%% @param W    List of validated `#source{}' records (whitelists).
+%% @returns The `#rpz{}' record if valid, or `[]' if sources are missing.
 validateCFGRPZ(RPZ,S,W) -> %Check: Sources, Whitelists
   SV = not lists:member(false, [ lists:member(X, [ Z#source.name || Z <- S ])  || X <- RPZ#rpz.sources  ]),
   WV = not lists:member(false, [ lists:member(X, [ Z#source.name || Z <- W ])  || X <- RPZ#rpz.whitelist ]),
@@ -442,15 +628,34 @@ validateCFGRPZ(RPZ,S,W) -> %Check: Sources, Whitelists
     true -> RPZ
   end.
 
+%% @doc Expand a key's group memberships into `{GroupName, KeyNameBin}' pairs.
+%% @private
 gen_group_array(Value, Groups) ->
 	[{X, Value} || X <- Groups].
 
+%% @doc Resolve the IXFR URL, substituting `[:AXFR:]' placeholders with the AXFR URL.
+%%
+%% If `IXFR' is empty (`""'), falls back to the AXFR URL. Otherwise, splits
+%% on `[:AXFR:]' tokens and replaces them with the actual AXFR URL string.
+%%
+%% @param AXFR  The AXFR URL string.
+%% @param IXFR  The IXFR URL string (may contain `[:AXFR:]' placeholders).
+%% @returns Resolved IXFR URL as a list of strings.
 parse_ixfr_url(AXFR,"") -> %empty IXFR
   AXFR;
 
 parse_ixfr_url(AXFR,IXFR) ->
   [ if X == "[:AXFR:]" -> AXFR; true -> X end || X <- re:split(IXFR,"(\\[:[^:]+:\\])",[{return,list},trim]), X /=[]].
 
+%% @doc Load persisted zone info (AXFR + IXFR) for a zone from the database.
+%%
+%% Combines results from {@link load_axfr_zone_info/1} and
+%% {@link load_ixfr_zone_info/1} to determine the zone's current status,
+%% serial, and timing information.
+%%
+%% @param Zone  An `#rpz{}' record with at least `zone', `axfr_time',
+%%              `zone_str', `ixfr_time', and `cache' fields populated.
+%% @returns A flat list of zone state values used during config parsing.
 load_zone_info(Zone) ->
   load_axfr_zone_info(Zone) ++ load_ixfr_zone_info(Zone).
 
@@ -497,11 +702,32 @@ load_ixfr_zone_info(ets,Zone) ->
 load_ixfr_zone_info(mnesia,_Zone) ->
   ok.
 
+%% @doc Check if a process is alive, treating `undefined' as alive.
+%%
+%% Used to detect stale zone-update PIDs stored in RPZ records. Returns
+%% `true' for `undefined' (no process was ever started) so the zone is
+%% considered eligible for a new update.
+%% @private
 my_process_is_alive(undefined)->
   true;
 my_process_is_alive(Pid)->
   is_process_alive(Pid).
 
+%% @doc Trigger zone updates for all cached RPZ zones.
+%%
+%% When called with `true', forces a full AXFR update on every cached zone
+%% regardless of expiry. When called with `false', only updates zones whose
+%% AXFR or IXFR refresh interval has elapsed, or zones marked `forceAXFR'
+%% (e.g., after a config reload).
+%%
+%% For each eligible zone, spawns a new process via {@link update_zone_full/1}
+%% or {@link update_zone_inc/1}. Skips zones that are already in `updating'
+%% status with a live process to avoid duplicate concurrent updates.
+%%
+%% Called periodically by `timer:apply_interval' set up in {@link init/1}.
+%%
+%% @param Force  `true' to force-update all zones; `false' for expiry-based.
+%% @returns `ok'.
 update_all_zones(true) -> %force update all zones
   AllRPZ = ets:match(cfg_table,{[rpz,'_'],'_','$4'}),
   [ spawn_opt(ioc2rpz_sup,update_zone_full,[X],[{fullsweep_after,0}]) || [X] <- AllRPZ,  X#rpz.cache == <<"true">>],
@@ -516,6 +742,16 @@ update_all_zones(false) -> %update expired zones
 	ok.
 
 
+%% @doc Perform a full AXFR zone update for a single RPZ zone.
+%%
+%% Sets the zone status to `updating' in `cfg_table', rebuilds the zone
+%% from IOC sources, and updates the serial, rule/IOC counts, and timestamps.
+%% If the zone content is unchanged (same MD5), only the check timestamp is
+%% updated. Otherwise, cached packets are deleted, DNS NOTIFY is sent to
+%% secondaries, and zone data is persisted.
+%%
+%% @param Zone  An `#rpz{}' record for the zone to update.
+%% @returns `ok'.
 update_zone_full(Zone) ->
   Pid=self(),
   CTime=ioc2rpz_fun:curr_serial_60(),%CTime=erlang:system_time(seconds),
@@ -542,6 +778,11 @@ update_zone_full(Zone) ->
   ok.
 
 
+%% @doc Trigger incremental (IXFR) zone updates for all cached zones.
+%%
+%% `true' forces incremental update on all cached zones. `false' only
+%% updates zones whose IXFR interval has elapsed and that are not
+%% currently updating.
 update_all_zones_inc(true) -> %force inc update all zones
   AllRPZ = ets:match(cfg_table,{[rpz,'_'],'_','$4'}),
   [ spawn(ioc2rpz_sup,update_zone_inc,[X]) || [X] <- AllRPZ,  X#rpz.cache == <<"true">>],
@@ -553,6 +794,14 @@ update_all_zones_inc(false) -> %update inc expired zones
   [ spawn(ioc2rpz_sup,update_zone_inc,[X]) || [X] <- AllRPZ,(X#rpz.ixfr_update_time + X#rpz.ixfr_time) < CTime,  X#rpz.cache == <<"true">>, X#rpz.status /= updating, X#rpz.ixfr_time /= 0 ],
 	ok.
 
+%% @doc Perform an incremental (IXFR) zone update for a single RPZ zone.
+%%
+%% Fetches new IOC indicators via IXFR sources, writes new records to the
+%% IXFR table, and if changes are detected, rebuilds the full AXFR zone
+%% cache. Sends DNS NOTIFY to secondaries on successful update.
+%%
+%% @param Zone  An `#rpz{}' record for the zone to update incrementally.
+%% @returns `ok'.
 update_zone_inc(Zone) ->
   %io:fwrite(group_leader(),"Zone ~p IOC  ~p ~n",[Zone#rpz.zone_str,IOC]),
   Pid=self(),
@@ -586,6 +835,14 @@ update_zone_inc(Zone) ->
 	ioc2rpz_fun:logMessage("Process PID ~p incremental update ~p finished in ~p seconds ~n",[Pid, Zone#rpz.zone_str, (ioc2rpz_fun:curr_serial_60()-CTime)]),
 	ok.
 
+%% @doc Rebuild the full AXFR zone cache from the current IXFR record set.
+%%
+%% Reads all active IOC records from the database, constructs SOA/NS records,
+%% and regenerates the zone packet cache. Used after an incremental update
+%% adds new indicators.
+%%
+%% @param Zone  An `#rpz{}' record with the current serial.
+%% @returns `{ok, NRules, NIOCs}' with the count of rules and indicators.
 rebuild_axfr_zone(Zone) ->
   IOCs = ioc2rpz_db:read_db_record(Zone,0,active),
   %ioc2rpz_fun:logMessage("rebuild AXFR IOCs ~p ~n",[IOCs]),

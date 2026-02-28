@@ -12,6 +12,14 @@
 %See the License for the specific language governing permissions and
 %limitations under the License.
 
+%% @doc REST API module for ioc2rpz server management.
+%%
+%% Implements a `cowboy_rest' handler providing JSON and plain-text
+%% endpoints for configuration reload, TSIG key updates, hot-cache
+%% management, RPZ zone operations, IOC lookups, and server/RPZ/source
+%% statistics.  All endpoints require HTTP Basic authentication against
+%% TSIG keys stored in `cfg_table' and an IP-based ACL check.
+%% @end
 -module(ioc2rpz_rest).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -21,21 +29,59 @@
 
 %-record(state, {op,user}). % can we redefine record???
 
+%% @doc Cowboy REST callback — initialise the handler.
+%%
+%% Extracts the operation atom (e.g. `reload_cfg', `stats_serv',
+%% `catch_all') from the route options and stores it in `#state.op'
+%% so that `srv_mgmt/3' can dispatch to the correct handler clause.
+%%
+%% @param Req   Cowboy request object.
+%% @param Opts  Route options list; the head element is the operation atom.
+%% @returns `{cowboy_rest, Req, State}'.
+%% @end
 init(Req, Opts) ->
     [Op | _] = Opts,
     State = #state{op=Op},
     {cowboy_rest, Req, State}.
 
+%% @doc Cowboy REST callback — declare supported HTTP methods.
+%% @returns `{[<<"GET">>, <<"POST">>], Req, State}'.
+%% @end
 allowed_methods(Req, State) ->
     Methods = [<<"GET">>, <<"POST">>],
     {Methods, Req, State}.
 
+%% @doc Cowboy REST callback — declare provided content types.
+%%
+%% Maps `application/json' to {@link to_json/2} and `text/plain' to
+%% {@link to_txt/2}.  Cowboy selects the handler via content negotiation.
+%%
+%% @returns `{[{MediaType, Handler}], Req, State}'.
+%% @end
 content_types_provided(Req, State) ->
     {[
       {<<"application/json">>, to_json},
       {<<"text/plain">>, to_txt}
      ], Req, State}.
 
+%% @doc Cowboy REST callback — authenticate and authorise the request.
+%%
+%% Performs two checks:
+%% <ol>
+%%   <li>IP-based ACL — the peer IP must appear in the server's
+%%       management ACL (`cfg_table' `srv' record).</li>
+%%   <li>HTTP Basic auth — the username must match a TSIG key name
+%%       (or key-group member) and the password must equal the
+%%       Base64-encoded key secret.</li>
+%% </ol>
+%% Bearer tokens are logged but currently rejected.  On failure a
+%% CEF log message is emitted and a `401' challenge is returned.
+%%
+%% @param Req   Cowboy request object.
+%% @param State Handler state.
+%% @returns `{true, Req, State}' on success, or
+%%          `{{false, Challenge}, Req, State}' on failure.
+%% @end
 is_authorized(Req, State) ->
 	#{peer := {IP, Port}} = Req,
 	[[MKeysT,ACL,Srv]] = ets:match(cfg_table,{srv,'_','_','$4','$5','_','$7'}),
@@ -74,16 +120,50 @@ is_authorized(Req, State) ->
 	end.
 
 
+%% @doc Content handler for `application/json' — delegates to {@link srv_mgmt/3}.
+%% @end
 to_json(Req, State) ->
 %  ioc2rpz_fun:logMessage("Req:\n~p\n\nState:\n~p\n\n",[Req,State]),
 	srv_mgmt(Req, State, json).
 
+%% @doc Content handler for `text/plain' — delegates to {@link srv_mgmt/3}.
+%% @end
 to_txt(Req, State) ->
 %  ioc2rpz_fun:logMessage("Req:\n~p\n\nState:\n~p\n\n",[Req,State]),
 	srv_mgmt(Req, State, txt).
 
 %	ioc2rpz_fun:logMessage("Req:\n~p\n\nState:\n~p\n\n",[Req,State]),
 
+%% @doc Dispatch an authenticated REST request to the appropriate handler.
+%%
+%% The function is multi-clause, guarded on `State#state.op'.  Each clause
+%% handles one REST endpoint, logs a CEF audit event, performs the
+%% operation, and returns a response body in the requested `Format'
+%% (`json' or `txt').
+%%
+%% Supported operations (one clause per endpoint):
+%% <ul>
+%%   <li>`reload_cfg'           — reload the full server configuration.</li>
+%%   <li>`update_tkeys'         — reload TSIG keys only.</li>
+%%   <li>`cache_sources_clear_all' — purge every source from the hot cache.</li>
+%%   <li>`cache_sources_clear_one' — purge a single named source from the hot cache.</li>
+%%   <li>`cache_sources_load_all'  — pre-load all sources into the hot cache.</li>
+%%   <li>`update_all_rpz'       — force-update every RPZ zone.</li>
+%%   <li>`update_rpz'           — force-update a single RPZ zone by name.</li>
+%%   <li>`terminate'            — gracefully shut down the server.</li>
+%%   <li>`stats_serv'           — return combined server, RPZ, and source statistics.</li>
+%%   <li>`stats_rpz'            — return RPZ zone statistics only.</li>
+%%   <li>`stats_source'         — return IOC source statistics only.</li>
+%%   <li>`get_rpz'              — export all IOC records for a given RPZ zone.</li>
+%%   <li>`get_ioc'              — look up which RPZ feeds contain a given IOC.</li>
+%%   <li>`catch_all'            — fallback for unrecognised endpoints (returns error).</li>
+%% </ul>
+%%
+%% @param Req    Cowboy request object.
+%% @param State  Handler state containing `#state.op' and `#state.user'.
+%% @param Format `json' | `txt'.
+%% @returns `{Body, Req, State}'.
+%% @end
 srv_mgmt(Req, State, Format) when State#state.op == reload_cfg -> %Reload server configuration
 	#{peer := {IP, Port}} = Req,
     ioc2rpz_fun:logMessageCEF(ioc2rpz_fun:msg_CEF(230),[ioc2rpz:ip_to_str(IP), Port, cowboy_req:path(Req), ""]),
@@ -363,12 +443,37 @@ get_tkey_zones(TKeyBin, Groups, [RPZ|Rest], Zones) ->
 	end,
 	get_tkey_zones(TKeyBin, Groups, Rest, Zones ++ AZ).
 
+%% @doc Collect per-RPZ-zone statistics from `cfg_table'.
+%%
+%% Returns a list of property-lists, one per RPZ zone whose
+%% `rule_count' is defined.  Each entry contains the zone name,
+%% rule/IOC counts, serial numbers, and update timestamps.
+%%
+%% @returns `[[{Key, Value}]]' suitable for JSON serialisation via
+%%          {@link list_tuples_to_json/1}.
+%% @end
 gen_rpz_stats() ->
 	[ [{"name",X#rpz.zone_str},{"rule_count",X#rpz.rule_count},{"ioc_count",X#rpz.ioc_count},{"serial",X#rpz.serial},{"serial_ixfr",X#rpz.serial_ixfr},{"update_time",X#rpz.update_time},{"ixfr_update_time",X#rpz.ixfr_update_time},{"ixfr_nz_update_time",X#rpz.ixfr_nz_update_time}] || [X]  <- ets:match(cfg_table,{[rpz,'_'],'_','$2'}), X#rpz.rule_count /= undefined].
 
+%% @doc Collect per-source statistics from `cfg_table'.
+%%
+%% Returns a list of property-lists, one per IOC source whose
+%% `ioc_count' is defined, containing the source name and indicator count.
+%%
+%% @returns `[[{Key, Value}]]'.
+%% @end
 gen_source_stats() ->
 	[ [{"name",X#source.name},{"ioc_count",X#source.ioc_count}] || [X]  <- ets:match(cfg_table,{[source,'_'],'$2'}), X#source.ioc_count /= undefined].
 
+%% @doc Collect server-wide statistics.
+%%
+%% Gathers the Erlang node name, total rule count across all RPZ zones,
+%% and memory consumption of the hot-cache, AXFR, and IXFR ETS tables.
+%% Delegates formatting to `gen_srv_stats/2'.
+%%
+%% @param Format `json' | `txt'.
+%% @returns Formatted string (iolist).
+%% @end
 gen_srv_stats(Format) ->
 	Srv_rules = lists:sum(([ X#rpz.rule_count || [X]  <- ets:match(cfg_table,{[rpz,'_'],'_','$2'}), X#rpz.rule_count /= undefined])),
 	Node=node(),

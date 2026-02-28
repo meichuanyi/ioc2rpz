@@ -12,7 +12,14 @@
 %See the License for the specific language governing permissions and
 %limitations under the License.
 
-%IOC2RPZ Connectors
+%% @doc IOC2RPZ Connectors.
+%%
+%% This module handles downloading, parsing, and cleaning IOC (Indicator of
+%% Compromise) data from various source types: local files, shell commands,
+%% and HTTP/HTTPS/FTP URLs. Downloaded IOC feeds are cleaned using configurable
+%% regex patterns and returned as lists of `{IOC, Expiration, Type}' tuples
+%% suitable for RPZ zone construction.
+%% @end
 
 -module(ioc2rpz_conn).
 -include_lib("ioc2rpz.hrl").
@@ -22,6 +29,16 @@
 -define(DEFAULT_REGEX,re:compile("^([A-Za-z0-9][A-Za-z0-9\-\._]+)[^A-Za-z0-9\-\._]*.*$",[{newline, any}])). %default clean up regex
 -define(NELINE_REGEX,re:compile(REX,[{newline, any}])).
 
+%% @doc Fetches IOC data from a source URL, cleans it, and returns parsed indicators.
+%%
+%% Downloads the raw feed via {@link get_ioc/2}, then splits the content by
+%% newline delimiters and applies regex-based cleaning via {@link p_clean_feed/4}.
+%% Logs the source size, MD5 hash, indicator count, and processing time.
+%%
+%% @param URL The source URL binary (e.g., `<<"http://...">>', `<<"file:...">>', `<<"shell:...">>').
+%% @param REGEX The regex pattern for IOC extraction: `none', `[]' (default), or a custom regex string.
+%% @param Source The `#source{}' record with name, max_ioc, and ioc_type fields.
+%% @returns A list of `{IOC, Expiration, Type}' tuples, or `[]' on download failure.
 get_ioc(URL,REGEX,Source) ->
   case get_ioc(URL,?Src_Retry) of
     {ok, Bin} ->
@@ -40,17 +57,41 @@ get_ioc(URL,REGEX,Source) ->
       []
   end.
 
+%% @doc Receives cleaned IOC data from a spawned worker process.
+%% @param PID The PID of the worker process to receive from.
+%% @returns A list of `{LowercaseIOC, Expiration, Type}' tuples.
 w_clean_feed(PID) ->
   receive
     { ok, PID, IOC } -> [ {ioc2rpz_fun:bin_to_lowcase(X),Y,Z} || {X,Y,Z} <- IOC ]
   end.
 
+%% @doc Parallelized IOC feed cleaning with optional max indicator limit.
+%%
+%% Splits the IOC list into chunks of `?IOCperProc' and spawns worker
+%% processes to clean each chunk concurrently via {@link clean_feed/3}.
+%% When `Max' is undefined or 0, all indicators are returned. Otherwise
+%% the result is truncated to `Max' entries.
+%%
+%% @param IOC List of raw IOC binaries (one per line).
+%% @param REGEX The regex pattern for extraction.
+%% @param Max Maximum number of indicators to return, or `undefined'/`0' for unlimited.
+%% @param IoCType The IOC type string (e.g., `"fqdn"', `"ip"', `"mixed"').
+%% @returns A list of `{IOC, Expiration, Type}' tuples.
 p_clean_feed(IOC,REGEX,Max,IoCType) when Max == undefined; Max == 0 ->
   p_clean_feed(IOC,REGEX,Max,0,IoCType);
 
 p_clean_feed(IOC,REGEX,Max,IoCType) when Max /= undefined ->
   lists:sublist(p_clean_feed(IOC,REGEX,Max,0,IoCType),Max).
 
+%% @doc Internal recursive worker for {@link p_clean_feed/4}.
+%% Splits IOC list, spawns a cleaning process for the first chunk, recurses
+%% on the remainder, then collects and concatenates results.
+%% @param IOC Remaining IOC binaries to process.
+%% @param REGEX The regex pattern.
+%% @param Max Maximum indicator limit.
+%% @param Count Running count of indicators processed so far.
+%% @param IoCType The IOC type string.
+%% @returns A list of `{IOC, Expiration, Type}' tuples.
 p_clean_feed(IOC,REGEX,Max,Count,IoCType)  ->
   ParentPID = self(),
   [IOC1,IOC2]=ioc2rpz_fun:split(IOC,?IOCperProc),
@@ -66,7 +107,14 @@ p_clean_feed(IOC,REGEX,Max,Count,IoCType)  ->
 
 
 
-%reads IOCs from a local file
+%% @doc Reads IOC data from a local file.
+%%
+%% Reads the entire file into memory. Retries up to `Retry' times with
+%% `?Src_Retry_TimeOut' second delays on failure.
+%%
+%% @param URL Binary of the form `<<"file:Path">>'.
+%% @param Retry Number of remaining retry attempts.
+%% @returns `{ok, Binary}' on success, or `{error, Reason}' after all retries exhausted.
 get_ioc(<<"file:",Filename/binary>> = URL, Retry) ->
   case file:read_file(Filename) of
     {ok, Bin} ->
@@ -80,11 +128,31 @@ get_ioc(<<"file:",Filename/binary>> = URL, Retry) ->
       {error, Reason}
   end;
 
-%IOCs are provided by a local script
+%% @doc Executes a local shell command and returns its output as IOC data.
+%%
+%% Passes the command string directly to `os:cmd/1'. The output is converted
+%% to a UTF-8 binary. No retries are attempted for shell sources.
+%%
+%% WARNING: The command is not sanitized. See task 11 for planned security hardening.
+%%
+%% @param URL Binary of the form `<<"shell:Command">>'.
+%% @param Retry Unused (shell commands are not retried).
+%% @returns `{ok, Binary}' containing the command output.
 get_ioc(<<"shell:",CMD/binary>> = _URL, _Retry) ->
   {ok, unicode:characters_to_binary(os:cmd(binary_to_list(CMD)))}; %fix for https://github.com/Homas/ioc2rpz/issues/47
 
-%download IOCs from http/https/ftp
+%% @doc Downloads IOC data from an HTTP, HTTPS, or FTP URL.
+%%
+%% Uses `httpc:request/4' with a Mozilla User-Agent header, cookies enabled,
+%% and a configurable timeout (`?SourcePullTimeout'). On HTTP 200, returns the
+%% response body. On non-200 status codes, logs a warning and returns an empty
+%% binary. Retries up to `Retry' times with `?Src_Retry_TimeOut' second delays
+%% on connection errors.
+%%
+%% @param URL Binary URL starting with `<<"http:">>', `<<"https">>', or `<<"ftp:/">>'.
+%% @param Retry Number of remaining retry attempts.
+%% @returns `{ok, Binary}' on success (including empty binary for non-200),
+%%          or `{error, Reason}' after all retries exhausted.
 get_ioc(<<Proto:5/bytes,_/binary>> = URL, Retry) when Proto == <<"http:">>;Proto == <<"https">>;Proto == <<"ftp:/">> ->
 	httpc:set_options([{cookies,enabled}]),
   case httpc:request(get,{binary_to_list(URL),[{"User-Agent", "Mozilla"}]},[{timeout, ?SourcePullTimeout}],[{body_format,binary},{sync,true}]) of %,{socket_opts,[{cookies,enabled}]}
@@ -155,17 +223,33 @@ get_ioc(<<Proto:5/bytes,_/binary>> = URL, Retry) when Proto == <<"http:">>;Proto
 %STIX/TAXII
 %OpenDXL
 
-%No clean REGEX
-%Read IOCs. One IOC per a line. Do not perform any modifications. Expiration date is not supported. During a next full zone update (AXFR update). All IOCs are refreshed;
+%% @doc Cleans an IOC feed with no regex transformation.
+%%
+%% When REGEX is `none', returns each non-empty line as-is with expiration 0.
+%% For `"mixed"' IOC type, auto-detects whether each entry is an IP or FQDN.
+%%
+%% @param IOC List of raw IOC binaries.
+%% @param none Atom indicating no regex cleaning.
+%% @param IoCType `"mixed"' for auto-detection, or a fixed type string.
+%% @returns A list of `{IOC, 0, Type}' tuples.
 clean_feed(IOC,none, "mixed") ->
   {ok,IPREX} = ?IP_REGEX,
   [ {X,0,check_if_ip(X, "mixed", IPREX)} || X <- IOC, X /= <<>>];
 
+%% @doc Cleans an IOC feed with no regex (non-mixed type).
+%% @see clean_feed/3
 clean_feed(IOC,none,IoCType) ->
   [ {X,0,IoCType} || X <- IOC, X /= <<>>];
 
-%Default REGEX
-%Extract IOCs,remove unsupported chars using standard REGEX. Expiration date is not supported;
+%% @doc Cleans an IOC feed using the default regex.
+%%
+%% Applies `?DEFAULT_REGEX' to extract the first capture group from each line,
+%% filtering out empty results. Auto-detects IP vs FQDN for mixed types.
+%%
+%% @param IOC List of raw IOC binaries.
+%% @param REGEX Empty list `[]' indicating default regex.
+%% @param IoCType The IOC type string.
+%% @returns A list of `{IOC, Expiration, Type}' tuples.
 clean_feed(IOC,[],IoCType) ->
   %TODO update regex
   {ok,MP} = ?DEFAULT_REGEX,
@@ -176,12 +260,31 @@ clean_feed(IOC,[],IoCType) ->
   [ X || X <- clean_feed(IOC,[],MP, IoCType, IPREX), X /= <<>>];
 
 
-%Extract IOCs,remove unsupported chars using user's defined REGEX. Expiration date is supported. First value - IOC, second - Exp. Date;
+%% @doc Cleans an IOC feed using a user-defined regex.
+%%
+%% Compiles the user's regex string and applies it to extract IOCs with
+%% optional expiration dates. The regex should have two capture groups:
+%% the first for the IOC value, the second for the expiration timestamp.
+%%
+%% @param IOC List of raw IOC binaries.
+%% @param REX User-defined regex string.
+%% @param IoCType The IOC type string.
+%% @returns A list of `{IOC, Expiration, Type}' tuples.
 clean_feed(IOC,REX,IoCType) -> %REX - user's regular expression
   {ok,MP} = ?NELINE_REGEX,
   {ok,IPREX} = ?IP_REGEX,
   [ X || X <- clean_feed(IOC,[],MP,IoCType, IPREX), X /= <<>>].
 
+%% @doc Recursive IOC cleaning worker. Applies the compiled regex to each line,
+%% extracting the IOC and optional expiration date from capture groups.
+%% Logs a warning for lines that don't match the regex pattern.
+%% @param Head The current IOC line binary.
+%% @param Tail Remaining IOC lines.
+%% @param CleanIOC Accumulator of cleaned IOC tuples.
+%% @param REX Compiled regex reference.
+%% @param IoCType The IOC type string.
+%% @param IPREX Compiled IP detection regex.
+%% @returns A list of `{IOC, Expiration, Type}' tuples.
 clean_feed([Head|Tail],CleanIOC,REX,IoCType, IPREX) ->
   IOC2 = case re:run(Head,REX,[global,notempty,{capture,[1,2],binary}]) of
     {match,[[IOC,<<>>]]} -> {IOC,0, check_if_ip(IOC, IoCType, IPREX)};
@@ -191,22 +294,39 @@ clean_feed([Head|Tail],CleanIOC,REX,IoCType, IPREX) ->
   clean_feed(Tail, [IOC2 | CleanIOC], REX, IoCType, IPREX);
 
 
+%% @doc Base case for recursive IOC cleaning. Returns the accumulated list.
 clean_feed([],CleanIOC,_REX,_IoCType, _IPREX) ->
   CleanIOC.
 
-%%%
-%%% Check if FQDN or IP
-%%%
+%% @doc Determines whether an IOC is an IP address or FQDN.
+%%
+%% For `"mixed"' type sources, matches the IOC against the IP regex.
+%% For non-mixed types, returns the type as-is.
+%%
+%% @param IOC The IOC binary to check.
+%% @param IoCType `"mixed"' for auto-detection, or a fixed type.
+%% @param IPREX Compiled IP detection regex.
+%% @returns `"ip"' or `"fqdn"' for mixed type; the original IoCType otherwise.
 check_if_ip(IOC, "mixed", IPREX) ->
   case re:run(IOC,IPREX,[global,notempty,{capture,[1],binary}]) of
    {match,_} ->"ip";
    _ -> "fqdn"
   end;
 
+%% @doc Passthrough for non-mixed IOC types.
+%% @see check_if_ip/3
 check_if_ip(_IOC, IoCType, _IPREX) ->
   IoCType.
 
-%%%Check memory consumtion
+%% @doc Alternative binary-accumulator IOC feed cleaner (experimental).
+%%
+%% Similar to {@link clean_feed/3} but accumulates results as a single
+%% binary with semicolon delimiters before splitting into tuples at the end.
+%% Used for memory consumption testing.
+%%
+%% @param IOC List of raw IOC binaries.
+%% @param REGEX `none', `[]' (default), or a custom regex string.
+%% @returns A list of `{IOC, Expiration}' tuples (without type field).
 clean_feed_bin(IOC,none) ->
   [ {X,0} || X <- IOC, X /= <<>>];
 
@@ -218,6 +338,8 @@ clean_feed_bin(IOC,REX) -> %REX - user's regular expression
   {ok,MP} = ?NELINE_REGEX,
   [ X || X <- clean_feed_bin(IOC,<<>>,MP), X /= <<>>].
 
+%% @doc Recursive binary-accumulator IOC cleaner.
+%% @see clean_feed_bin/2
 clean_feed_bin([Head|Tail],CleanIOC,REX) ->
   IOC2 = case re:run(Head,REX,[global,notempty,{capture,[1,2],binary}]) of
     {match,[[IOC,<<>>]]} -> <<(ioc2rpz_fun:bin_to_lowcase(IOC))/binary,",",0,";">>;
@@ -225,11 +347,20 @@ clean_feed_bin([Head|Tail],CleanIOC,REX) ->
     _Else -> <<>>
   end,
   clean_feed_bin(Tail, <<CleanIOC/binary,IOC2/binary>>, REX);
+%% @doc Base case: splits the accumulated binary by semicolons and commas
+%% into `{IOC, Expiration}' tuples.
 clean_feed_bin([],CleanIOC,_REX) ->
   [ {A,B} || [A,B] <- [ ioc2rpz_fun:split_tail(X,<<",">>) || X <- ioc2rpz_fun:split_tail(CleanIOC,<<";">>), X /= <<>> ]].
 %%%Check memory consumtion
 
 
+%% @doc Converts an ISO 8601 datetime binary to a Unix timestamp (integer).
+%%
+%% Accepts format `<<"YYYY-MM-DDThh:mm:ss">>' (with `T', `t', or space separator).
+%% Returns 0 for unrecognized formats.
+%%
+%% @param Binary An ISO 8601 datetime binary.
+%% @returns Unix timestamp as integer, or `0' if parsing fails.
 conv_t2i(<<Y:4/bytes,"-",M:2/bytes,"-",D:2/bytes,Sep:1/bytes,HH:2/bytes,":",MM:2/bytes,":",SS:2/bytes,_Rest/binary>>) when Sep==<<"T">>;Sep==<<"t">>;Sep==<<" ">>->
   calendar:datetime_to_gregorian_seconds({{binary_to_integer(Y), binary_to_integer(M), binary_to_integer(D)}, {binary_to_integer(HH), binary_to_integer(MM), binary_to_integer(SS)}})-62167219200;
 conv_t2i(_EXP) ->

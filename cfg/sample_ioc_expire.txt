@@ -1,0 +1,17 @@
+# Sample IOC source — indicators WITH expiration timestamps
+# Format: <indicator><TAB><expiration_timestamp>
+# Timestamps use ISO 8601 format: YYYY-MM-DDThh:mm:ss
+# ioc2rpz automatically removes expired indicators during zone rebuilds.
+# Use regex: "^([A-Za-z0-9][A-Za-z0-9\-\._]+)[\s|\t]+([0-9:TZ -.]+)?$"
+malware-jan.example.com	2036-01-31T23:59:59
+malware-feb.example.com	2036-02-28T23:59:59
+malware-mar.example.com	2036-03-31T23:59:59
+phish-campaign-01.example.com	2036-06-15T00:00:00
+phish-campaign-02.example.com	2036-06-15T00:00:00
+192.0.2.30	2036-04-01T12:00:00
+198.51.100.44	2036-05-01T12:00:00
+203.0.113.99	2036-12-31T23:59:59
+2001:db8:c::dead	2036-07-01T00:00:00
+temp-dga-seed.example.com	2036-03-15T08:00:00
+short-lived-c2.example.com	2036-03-01T00:00:00
+seasonal-spam.example.com	2036-09-30T23:59:59

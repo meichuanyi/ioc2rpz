@@ -37,7 +37,7 @@ https://github.com/ChicagoBoss/ChicagoBoss/wiki/Automatic-schema-initialization-
 - [ ] DoD https://tools.ietf.org/html/draft-ietf-dprive-dnsodtls-06
 
 - [ ] EUnit Tests for main funs.
-- [ ] Handle RPZ update if one of a sources is not availble or a recent update returned significatnly low number of indicators
+- [ ] Handle RPZ update if one of a sources is not available or a recent update returned significantly low number of indicators
 
 ## Sources
 - [ ] Simultanious source downloads
